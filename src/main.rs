@@ -37,7 +37,8 @@ fn main() -> eframe::Result {
             eprintln!("error: no friend with id '{id}'");
             std::process::exit(1);
         };
-        let accent = theme::palette(cfg.theme).accent_color(f.accent);
+        let sys = theme::system_theme().unwrap_or(egui::Theme::Dark);
+        let accent = theme::palette(sys).accent_color(f.accent);
         let result = share::encode_card(f, [accent.r(), accent.g(), accent.b()]).and_then(|card| {
             card.save_with_format(out, image::ImageFormat::Png)
                 .map_err(|e| e.to_string())

@@ -38,8 +38,8 @@ actually say — with a little talking animation. Teach it which lines land with
 - **friend cards** — share a friend as a PNG with their whole config (quotes,
   weights, photo, behavior) embedded in the pixels; copy/paste or send as a
   file, import via friends → paste card
-- **sizes** — avatar size 56–96 px, bubble duration, corner, dark/light theme,
-  all in config → behavior
+- **sizes** — avatar size 56–96 px, bubble duration, corner, all in config →
+  behavior; dark/light theme follows the system preference automatically
 
 ## install
 

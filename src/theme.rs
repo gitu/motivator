@@ -2,7 +2,7 @@
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke};
 
-use crate::config::{Accent, Theme};
+use crate::config::Accent;
 
 pub struct Palette {
     pub background: Color32,
@@ -66,10 +66,81 @@ pub const LIGHT: Palette = Palette {
     shadow_alpha: 34,
 };
 
-pub fn palette(theme: Theme) -> &'static Palette {
+pub fn palette(theme: egui::Theme) -> &'static Palette {
     match theme {
-        Theme::Dark => &DARK,
-        Theme::Light => &LIGHT,
+        egui::Theme::Dark => &DARK,
+        egui::Theme::Light => &LIGHT,
+    }
+}
+
+/// Ask the desktop what color scheme it prefers.
+///
+/// winit reports no system theme on X11/Wayland, so on Linux we read the XDG
+/// desktop portal's `color-scheme` setting over D-Bus (the same source GTK and
+/// Firefox use) — shelling out like the fontconfig lookup below. Returns None
+/// when the desktop expresses no preference or the lookup fails.
+#[cfg(target_os = "linux")]
+pub fn system_theme() -> Option<egui::Theme> {
+    portal_color_scheme().or_else(gnome_color_scheme)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn system_theme() -> Option<egui::Theme> {
+    None
+}
+
+/// org.freedesktop.appearance color-scheme: 0 = no preference, 1 = dark, 2 = light
+#[cfg(target_os = "linux")]
+fn portal_color_scheme() -> Option<egui::Theme> {
+    let out = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply=literal",
+            "--reply-timeout=1000",
+            "--dest=org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings.Read",
+            "string:org.freedesktop.appearance",
+            "string:color-scheme",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_portal_reply(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse a `dbus-send --print-reply=literal` reply like
+/// `   variant       variant          uint32 1`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_portal_reply(reply: &str) -> Option<egui::Theme> {
+    match reply.rsplit("uint32").next()?.trim().parse::<u32>().ok()? {
+        1 => Some(egui::Theme::Dark),
+        2 => Some(egui::Theme::Light),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_color_scheme() -> Option<egui::Theme> {
+    let out = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+        .ok()?;
+    parse_gsettings_scheme(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `gsettings get org.gnome.desktop.interface color-scheme` output
+/// (`'prefer-dark'`, `'prefer-light'`, or `'default'`).
+#[cfg(any(target_os = "linux", test))]
+fn parse_gsettings_scheme(s: &str) -> Option<egui::Theme> {
+    if s.contains("prefer-dark") {
+        Some(egui::Theme::Dark)
+    } else if s.contains("prefer-light") {
+        Some(egui::Theme::Light)
+    } else {
+        None
     }
 }
 
@@ -233,4 +304,64 @@ pub fn install_fonts(ctx: &egui::Context) {
             .insert(0, "ds-mono".to_owned());
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_reply_maps_the_color_scheme_values() {
+        // 0 = no preference, 1 = dark, 2 = light
+        let reply = |n: u32| format!("   variant       variant          uint32 {n}\n");
+        assert_eq!(parse_portal_reply(&reply(1)), Some(egui::Theme::Dark));
+        assert_eq!(parse_portal_reply(&reply(2)), Some(egui::Theme::Light));
+        assert_eq!(parse_portal_reply(&reply(0)), None);
+        assert_eq!(parse_portal_reply(&reply(7)), None);
+    }
+
+    #[test]
+    fn portal_reply_garbage_is_no_preference() {
+        assert_eq!(parse_portal_reply(""), None);
+        assert_eq!(
+            parse_portal_reply("Error org.freedesktop.portal.Error.NotFound: not found"),
+            None
+        );
+        assert_eq!(parse_portal_reply("variant uint32 banana"), None);
+    }
+
+    #[test]
+    fn gsettings_output_maps_the_color_scheme_values() {
+        assert_eq!(
+            parse_gsettings_scheme("'prefer-dark'\n"),
+            Some(egui::Theme::Dark)
+        );
+        assert_eq!(
+            parse_gsettings_scheme("'prefer-light'\n"),
+            Some(egui::Theme::Light)
+        );
+        assert_eq!(parse_gsettings_scheme("'default'\n"), None);
+        assert_eq!(parse_gsettings_scheme(""), None);
+    }
+
+    #[test]
+    fn palette_matches_the_theme() {
+        assert!(palette(egui::Theme::Dark).background.r() < 128);
+        assert!(palette(egui::Theme::Light).background.r() >= 128);
+    }
+
+    #[test]
+    fn apply_style_overwrites_both_side_by_side_styles() {
+        // the palette is the single source of truth: egui keeps a light and a
+        // dark style, and apply_style must overwrite both
+        let ctx = egui::Context::default();
+        for (pal, dark_mode) in [(&DARK, true), (&LIGHT, false)] {
+            apply_style(&ctx, pal);
+            for t in [egui::Theme::Dark, egui::Theme::Light] {
+                let v = &ctx.style_of(t).visuals;
+                assert_eq!(v.dark_mode, dark_mode);
+                assert_eq!(v.window_fill, pal.card);
+            }
+        }
+    }
 }
