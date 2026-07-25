@@ -14,7 +14,7 @@ use crate::schedule;
 use crate::share;
 use crate::theme::{self, Palette};
 
-/// margin inside the (transparent) window so panel shadows aren't clipped
+/// margin inside the (transparent) window around the panel stack
 const PAD: f32 = 16.0;
 /// gap between the widget and the screen edge
 const SCREEN_MARGIN: f32 = 24.0;
@@ -799,12 +799,6 @@ impl MotivatorApp {
             .stroke(Stroke::new(1.0_f32, pal.border))
             .corner_radius(CornerRadius::same(12))
             .inner_margin(Margin::same(14))
-            .shadow(egui::epaint::Shadow {
-                offset: [0, 8],
-                blur: 24,
-                spread: 0,
-                color: Color32::from_black_alpha(pal.shadow_alpha),
-            })
     }
 
     fn mini_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, px: f32) {

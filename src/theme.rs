@@ -17,7 +17,6 @@ pub struct Palette {
     pub destructive: Color32,
     pub success: Color32,
     accents: [Color32; 6],
-    pub shadow_alpha: u8,
 }
 
 pub const DARK: Palette = Palette {
@@ -40,7 +39,6 @@ pub const DARK: Palette = Palette {
         Color32::from_rgb(206, 132, 167), // pink
         Color32::from_rgb(213, 179, 106), // amber
     ],
-    shadow_alpha: 100,
 };
 
 pub const LIGHT: Palette = Palette {
@@ -63,7 +61,6 @@ pub const LIGHT: Palette = Palette {
         Color32::from_rgb(178, 87, 133),
         Color32::from_rgb(192, 142, 67),
     ],
-    shadow_alpha: 34,
 };
 
 pub fn palette(theme: egui::Theme) -> &'static Palette {
@@ -176,6 +173,9 @@ fn apply_to(style: &mut egui::Style, pal: &Palette) {
     v.panel_fill = Color32::TRANSPARENT;
     v.window_fill = pal.card;
     v.window_stroke = Stroke::new(1.0_f32, pal.border);
+    // flat design: panels draw a single 1px border, no drop shadows
+    v.window_shadow = egui::epaint::Shadow::NONE;
+    v.popup_shadow = egui::epaint::Shadow::NONE;
     v.extreme_bg_color = pal.background; // text edit background
     v.faint_bg_color = pal.muted;
     v.selection.bg_fill = pal.primary.gamma_multiply(0.35);
