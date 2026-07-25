@@ -8,8 +8,9 @@ use egui::{
 };
 
 use crate::api::{self, ApiEvent};
-use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc, Theme};
+use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc};
 use crate::photo;
+use crate::share;
 use crate::theme::{self, Palette};
 
 /// margin inside the (transparent) window so panel shadows aren't clipped
@@ -18,14 +19,14 @@ const PAD: f32 = 16.0;
 const SCREEN_MARGIN: f32 = 24.0;
 const SPEAK_SECS: f32 = 1.7;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Panel {
     Chat,
     Friends,
     Config,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
     Friend,
     Quotes,
@@ -42,6 +43,12 @@ struct Bubble {
     text: String,
     tag: &'static str,
     deadline: Instant,
+}
+
+/// results of friend-card work done off the UI thread (file dialogs)
+enum ShareEvent {
+    Import(Result<(share::SharedFriend, Option<Vec<u8>>), String>),
+    Note(String),
 }
 
 pub fn initial_size(_cfg: &Config) -> [f32; 2] {
@@ -86,23 +93,48 @@ pub struct MotivatorApp {
     gen_busy: bool,
     api_note: String,
     photo_note: String,
+    share_note: String,
 
     api_rx: Receiver<ApiEvent>,
     api_tx: Sender<ApiEvent>,
     photo_rx: Receiver<(String, Result<photo::Processed, String>)>,
     photo_tx: Sender<(String, Result<photo::Processed, String>)>,
+    share_rx: Receiver<ShareEvent>,
+    share_tx: Sender<ShareEvent>,
+    /// kept for the app's lifetime — on X11 clipboard contents vanish when the
+    /// owning `Clipboard` is dropped
+    clip: Option<arboard::Clipboard>,
 
     textures: HashMap<String, egui::TextureHandle>,
-    last_applied_theme: Option<Theme>,
+    /// resolved system theme currently in effect
+    theme: egui::Theme,
+    /// desktop preference from the portal watcher thread (None = no signal)
+    sys_theme: Option<egui::Theme>,
+    theme_rx: Receiver<egui::Theme>,
+    theme_tx: Sender<egui::Theme>,
+    style_applied: bool,
 }
 
 impl MotivatorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
         theme::install_fonts(&cc.egui_ctx);
+        let mut app = Self::from_config(cfg);
+        app.watch_system_theme(cc.egui_ctx.clone());
+        // greet with the first line in rotation, like the design's initial bubble
+        app.speak();
+        app
+    }
+
+    fn from_config(cfg: Config) -> Self {
         let (api_tx, api_rx) = channel();
         let (photo_tx, photo_rx) = channel();
+        let (share_tx, share_rx) = channel();
+        // the desktop's color-scheme preference: read once so the first frame
+        // paints correctly; new() spawns the watcher for live changes
+        let sys_theme = theme::system_theme();
+        let (theme_tx, theme_rx) = channel();
         let place = cfg.corner;
-        let mut app = MotivatorApp {
+        MotivatorApp {
             cfg,
             dirty_since: None,
             place,
@@ -126,20 +158,45 @@ impl MotivatorApp {
             gen_busy: false,
             api_note: String::new(),
             photo_note: String::new(),
+            share_note: String::new(),
             api_rx,
             api_tx,
             photo_rx,
             photo_tx,
+            share_rx,
+            share_tx,
+            clip: None,
             textures: HashMap::new(),
-            last_applied_theme: None,
-        };
-        // greet with the first line in rotation, like the design's initial bubble
-        app.speak();
-        app
+            theme: sys_theme.unwrap_or(egui::Theme::Dark),
+            sys_theme,
+            theme_rx,
+            theme_tx,
+            style_applied: false,
+        }
+    }
+
+    /// Watch the desktop's color-scheme preference from a thread — winit
+    /// delivers no theme events on X11/Wayland, so we poll.
+    fn watch_system_theme(&self, egui_ctx: egui::Context) {
+        let theme_tx = self.theme_tx.clone();
+        let mut last = self.sys_theme;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let t = theme::system_theme();
+            if t != last {
+                last = t;
+                if let Some(t) = t {
+                    if theme_tx.send(t).is_err() {
+                        return;
+                    }
+                    egui_ctx.request_repaint();
+                }
+            }
+        });
     }
 
     fn pal(&self) -> &'static Palette {
-        theme::palette(self.cfg.theme)
+        theme::palette(self.theme)
     }
 
     fn placement(&self, monitor: Option<Vec2>) -> Corner {
@@ -369,6 +426,132 @@ impl MotivatorApp {
         });
     }
 
+    fn clipboard(&mut self) -> Result<&mut arboard::Clipboard, String> {
+        if self.clip.is_none() {
+            self.clip = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        Ok(self.clip.as_mut().unwrap())
+    }
+
+    fn encode_active_card(&self) -> Result<image::RgbaImage, String> {
+        let f = self.active();
+        let accent = self.pal().accent_color(f.accent);
+        share::encode_card(f, [accent.r(), accent.g(), accent.b()])
+    }
+
+    fn share_copy(&mut self) {
+        let card = match self.encode_active_card() {
+            Ok(c) => c,
+            Err(e) => {
+                self.share_note = e;
+                return;
+            }
+        };
+        let data = arboard::ImageData {
+            width: card.width() as usize,
+            height: card.height() as usize,
+            bytes: card.into_raw().into(),
+        };
+        self.share_note = match self
+            .clipboard()
+            .and_then(|c| c.set_image(data).map_err(|e| e.to_string()))
+        {
+            Ok(()) => "card copied — paste it anywhere".into(),
+            Err(e) => format!("clipboard failed: {e}"),
+        };
+    }
+
+    fn share_save(&mut self, ctx: &egui::Context) {
+        let card = match self.encode_active_card() {
+            Ok(c) => c,
+            Err(e) => {
+                self.share_note = e;
+                return;
+            }
+        };
+        let name = self.active().name.replace(char::is_whitespace, "-");
+        let tx = self.share_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("save friend card")
+                .set_file_name(format!("{name}-card.png"))
+                .add_filter("png image", &["png"])
+                .save_file()
+            {
+                // always PNG regardless of typed extension — a lossy format
+                // would destroy the embedded config
+                let note = match card.save_with_format(&path, image::ImageFormat::Png) {
+                    Ok(()) => format!("card saved to {}", path.display()),
+                    Err(e) => format!("save failed: {e}"),
+                };
+                let _ = tx.send(ShareEvent::Note(note));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn share_paste(&mut self) {
+        let img = match self
+            .clipboard()
+            .and_then(|c| c.get_image().map_err(|e| e.to_string()))
+        {
+            Ok(i) => i,
+            Err(_) => {
+                self.share_note = "no image in the clipboard".into();
+                return;
+            }
+        };
+        let Some(rgba) =
+            image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+        else {
+            self.share_note = "clipboard image was malformed".into();
+            return;
+        };
+        match share::decode_card(&rgba) {
+            Ok((s, photo)) => self.import_shared(s, photo),
+            Err(e) => self.share_note = e,
+        }
+    }
+
+    fn share_open(&mut self, ctx: &egui::Context) {
+        let tx = self.share_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("open a friend card")
+                .add_filter("png image", &["png"])
+                .pick_file()
+            {
+                let result = image::open(&path)
+                    .map_err(|e| format!("could not read image: {e}"))
+                    .and_then(|img| share::decode_card(&img.to_rgba8()));
+                let _ = tx.send(ShareEvent::Import(result));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn import_shared(&mut self, s: share::SharedFriend, photo_png: Option<Vec<u8>>) {
+        let name = if s.name.is_empty() {
+            "friend".to_string()
+        } else {
+            s.name.clone()
+        };
+        match share::import_into(&mut self.cfg, s, photo_png) {
+            Ok(_) => {
+                self.share_note = format!("imported {name}");
+                self.panel = Some(Panel::Config);
+                self.tab = Tab::Friend;
+                self.bubble = None;
+                self.chat.clear();
+                self.next_nudge = None;
+                self.mark_dirty();
+            }
+            Err(e) => self.share_note = e,
+        }
+    }
+
     fn drain_events(&mut self) {
         while let Ok(ev) = self.api_rx.try_recv() {
             match ev {
@@ -413,6 +596,13 @@ impl MotivatorApp {
                         Err(e) => format!("failed: {e}"),
                     }
                 }
+            }
+        }
+        while let Ok(ev) = self.share_rx.try_recv() {
+            match ev {
+                ShareEvent::Note(n) => self.share_note = n,
+                ShareEvent::Import(Ok((s, photo))) => self.import_shared(s, photo),
+                ShareEvent::Import(Err(e)) => self.share_note = e,
             }
         }
         while let Ok((id, result)) = self.photo_rx.try_recv() {
@@ -524,22 +714,6 @@ impl MotivatorApp {
                 spread: 0,
                 color: Color32::from_black_alpha(pal.shadow_alpha),
             })
-    }
-
-    fn chip(&self, ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
-        let pal = self.pal();
-        let (bg, fg) = if active {
-            (pal.accent, pal.foreground)
-        } else {
-            (pal.card, pal.muted_fg)
-        };
-        let resp = ui.add(
-            egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
-                .fill(bg)
-                .stroke(Stroke::new(1.0_f32, pal.border))
-                .corner_radius(CornerRadius::same(20)),
-        );
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
     fn mini_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, px: f32) {
@@ -736,11 +910,26 @@ impl MotivatorApp {
         if resp.clicked() {
             self.speak();
         }
+        let mut open: Option<Panel> = None;
         resp.context_menu(|ui| {
+            for (panel, label) in [
+                (Panel::Chat, "chat"),
+                (Panel::Friends, "friends"),
+                (Panel::Config, "config"),
+            ] {
+                if ui.button(label).clicked() {
+                    open = Some(panel);
+                    ui.close();
+                }
+            }
+            ui.separator();
             if ui.button("quit motivator").clicked() {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
             }
         });
+        if let Some(panel) = open {
+            self.panel = Some(panel);
+        }
     }
 
     fn avatar_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -762,17 +951,6 @@ impl MotivatorApp {
         ui.allocate_ui_with_layout(vec2(ui.available_width(), row_h), layout, |ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             self.draw_avatar(ui, ctx);
-            ui.add_space(4.0);
-            for (panel, label) in [
-                (Panel::Config, "config"),
-                (Panel::Friends, "friends"),
-                (Panel::Chat, "chat"),
-            ] {
-                let active = self.panel == Some(panel);
-                if self.chip(ui, label, active).clicked() {
-                    self.panel = if active { None } else { Some(panel) };
-                }
-            }
         });
     }
 
@@ -992,6 +1170,8 @@ impl MotivatorApp {
         let mut pick: Option<String> = None;
         let mut del: Option<String> = None;
         let mut add = false;
+        let mut paste = false;
+        let mut open = false;
         self.panel_frame()
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
@@ -1082,6 +1262,18 @@ impl MotivatorApp {
                             .min_size(vec2(236.0, 30.0)),
                         )
                         .clicked();
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(self.label_text("got a friend card?"));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            open = self.tiny_button(ui, "open card…").clicked();
+                            paste = self.tiny_button(ui, "paste card").clicked();
+                        });
+                    });
+                    if !self.share_note.is_empty() {
+                        let note = self.share_note.clone();
+                        ui.label(self.label_text(&note));
+                    }
                 })
             });
         if close {
@@ -1095,6 +1287,12 @@ impl MotivatorApp {
         }
         if add {
             self.add_friend();
+        }
+        if paste {
+            self.share_paste();
+        }
+        if open {
+            self.share_open(ctx);
         }
     }
 
@@ -1238,6 +1436,41 @@ impl MotivatorApp {
                 self.active_mut().accent = a;
             }
         });
+        ui.label(
+            RichText::new("share")
+                .font(theme::font_ui())
+                .color(pal.foreground),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("copy card").font(theme::font_ui()),
+                ))
+                .clicked()
+            {
+                self.share_copy();
+            }
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("save card…").font(theme::font_ui()),
+                ))
+                .clicked()
+            {
+                self.share_save(ctx);
+            }
+        });
+        ui.label(self.label_text(
+            "a png of them with their whole config inside — import via friends → paste card",
+        ));
+        if !self.share_note.is_empty() {
+            let note = self.share_note.clone();
+            ui.label(
+                RichText::new(note)
+                    .font(theme::font_label())
+                    .color(pal.foreground),
+            );
+        }
     }
 
     fn tab_quotes(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1461,23 +1694,6 @@ impl MotivatorApp {
         {
             self.mark_dirty();
         }
-        ui.horizontal(|ui| {
-            ui.label(self.label_text("theme"));
-            let mut t = self.cfg.theme;
-            egui::ComboBox::from_id_salt("theme")
-                .selected_text(
-                    RichText::new(if t == Theme::Dark { "dark" } else { "light" })
-                        .font(theme::font_ui()),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut t, Theme::Dark, "dark");
-                    ui.selectable_value(&mut t, Theme::Light, "light");
-                });
-            if t != self.cfg.theme {
-                self.cfg.theme = t;
-                self.mark_dirty();
-            }
-        });
     }
 
     fn tab_api(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1719,9 +1935,16 @@ impl eframe::App for MotivatorApp {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        if self.last_applied_theme != Some(self.cfg.theme) {
+        while let Ok(t) = self.theme_rx.try_recv() {
+            self.sys_theme = Some(t);
+        }
+        // the portal preference wins; winit's system theme covers the
+        // platforms where it works (and its dark fallback everywhere else)
+        let resolved = self.sys_theme.unwrap_or_else(|| ctx.theme());
+        if !self.style_applied || resolved != self.theme {
+            self.theme = resolved;
             theme::apply_style(&ctx, self.pal());
-            self.last_applied_theme = Some(self.cfg.theme);
+            self.style_applied = true;
         }
         self.drain_events();
         self.tick_timers();
@@ -1806,6 +2029,18 @@ mod tests {
 
     fn titles(pool: &[&Quote]) -> Vec<String> {
         pool.iter().map(|q| q.t.clone()).collect()
+    }
+
+    fn app() -> MotivatorApp {
+        MotivatorApp::from_config(Config::default())
+    }
+
+    fn bubble(text: &str) -> Bubble {
+        Bubble {
+            text: text.into(),
+            tag: "",
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
     }
 
     #[test]
@@ -1905,5 +2140,146 @@ mod tests {
             clamp_to_monitor(Pos2::new(10.0, 10.0), vec2(4000.0, 4000.0), m),
             Pos2::ZERO
         );
+    }
+
+    #[test]
+    fn interface_hidden_by_default() {
+        let app = app();
+        assert!(app.panel.is_none(), "no panel may be open on startup");
+        assert!(app.bubble.is_none(), "greeting only happens via new()");
+    }
+
+    #[test]
+    fn pick_quote_avoids_repeating_current_bubble() {
+        let mut app = app();
+        app.active_mut().quotes = vec![Quote::sample("one"), Quote::sample("two")];
+        app.bubble = Some(bubble("one"));
+        for _ in 0..20 {
+            let (t, _) = app.pick_quote().expect("pool is non-empty");
+            assert_eq!(t, "two");
+        }
+    }
+
+    #[test]
+    fn speak_sets_bubble_and_talking_animation() {
+        let mut app = app();
+        app.speak();
+        assert!(app.bubble.is_some());
+        assert!(app.speak_start.is_some());
+    }
+
+    #[test]
+    fn react_down_mutes_and_notes() {
+        let mut app = app();
+        app.active_mut().quotes = vec![Quote::sample("go")];
+        app.bubble = Some(bubble("go"));
+        app.react(-1);
+        assert_eq!(app.active().quotes[0].w, 0);
+        let (note, _) = app.note.as_ref().expect("mute note shown");
+        assert!(note.contains("muted"), "note={note}");
+    }
+
+    #[test]
+    fn pick_friend_switches_resets_and_closes_panel() {
+        let mut app = app();
+        app.panel = Some(Panel::Chat);
+        app.chat.push(ChatMsg {
+            me: true,
+            t: "hi".into(),
+        });
+        app.pick_friend("ana");
+        assert_eq!(app.cfg.active, "ana");
+        assert!(app.panel.is_none(), "panel closes after switching");
+        assert!(app.chat.is_empty(), "chat history belongs to one friend");
+        assert!(app.bubble.is_some(), "new friend greets right away");
+    }
+
+    #[test]
+    fn pick_same_friend_only_closes_panel() {
+        let mut app = app();
+        app.panel = Some(Panel::Friends);
+        let before = app.cfg.active.clone();
+        app.pick_friend(&before);
+        assert_eq!(app.cfg.active, before);
+        assert!(app.panel.is_none());
+    }
+
+    #[test]
+    fn add_friend_opens_config_panel() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        app.add_friend();
+        assert_eq!(app.cfg.friends.len(), n + 1);
+        assert_eq!(app.cfg.active, app.cfg.friends[n].id);
+        assert_eq!(app.panel, Some(Panel::Config), "jump straight to setup");
+        assert_eq!(app.tab, Tab::Friend);
+    }
+
+    #[test]
+    fn del_friend_reassigns_active_and_keeps_last() {
+        let mut app = app();
+        let first = app.cfg.friends[0].id.clone();
+        app.pick_friend(&first);
+        app.del_friend(&first);
+        assert!(app.cfg.friends.iter().all(|f| f.id != first));
+        assert_eq!(app.cfg.active, app.cfg.friends[0].id);
+        while app.cfg.friends.len() > 1 {
+            let id = app.cfg.friends[0].id.clone();
+            app.del_friend(&id);
+        }
+        let last = app.cfg.friends[0].id.clone();
+        app.del_friend(&last);
+        assert_eq!(app.cfg.friends.len(), 1, "the last friend is undeletable");
+    }
+
+    #[test]
+    fn canned_reply_never_empty() {
+        let mut app = app();
+        app.active_mut().quotes.clear();
+        for _ in 0..20 {
+            assert!(!app.canned_reply().is_empty());
+        }
+    }
+
+    #[test]
+    fn share_card_roundtrip_through_import() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        // full path a paste takes: encode the active friend, decode the card,
+        // import the result
+        let card = app.encode_active_card().unwrap();
+        let (shared, photo) = share::decode_card(&card).unwrap();
+        let expected = app.active().name.clone();
+        app.import_shared(shared, photo);
+        assert_eq!(app.cfg.friends.len(), n + 1);
+        let imported = app.cfg.friends.last().unwrap();
+        assert_eq!(imported.name, expected);
+        assert_eq!(app.cfg.active, imported.id);
+        assert!(matches!(app.panel, Some(Panel::Config)));
+        assert!(matches!(app.tab, Tab::Friend));
+        assert!(app.share_note.contains("imported"), "{}", app.share_note);
+        assert!(app.dirty_since.is_some(), "import must schedule a save");
+    }
+
+    #[test]
+    fn import_shared_surfaces_errors() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        let shared = share::decode_card(&app.encode_active_card().unwrap())
+            .unwrap()
+            .0;
+        // photo bytes that aren't an image must fail without adding a friend
+        app.import_shared(shared, Some(vec![1, 2, 3]));
+        assert_eq!(app.cfg.friends.len(), n);
+        assert!(app.share_note.contains("bad photo"), "{}", app.share_note);
+    }
+
+    #[test]
+    fn mix_blends_endpoints() {
+        let a = Color32::from_rgb(0, 0, 0);
+        let b = Color32::from_rgb(200, 100, 50);
+        assert_eq!(mix(a, b, 0.0), a);
+        assert_eq!(mix(a, b, 1.0), b);
+        assert_eq!(mix(a, b, 0.5), Color32::from_rgb(100, 50, 25));
     }
 }
