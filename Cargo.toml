@@ -1,0 +1,23 @@
+[package]
+name = "motivator"
+version = "0.1.0"
+edition = "2021"
+description = "a friend in the corner of your desktop. it says the things they'd actually say."
+license = "MIT"
+repository = "https://github.com/gitu/motivator"
+readme = "README.md"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+ureq = { version = "2", features = ["json"] }
+rfd = "0.15"
+fastrand = "2"
+
+[profile.release]
+lto = true
+strip = true
