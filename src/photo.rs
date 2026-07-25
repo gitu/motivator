@@ -52,6 +52,21 @@ pub fn process_and_store(src: &Path, stem: &str, mode: PhotoMode) -> Result<Proc
     process_bytes(&bytes, ext, &dir, stem, mode)
 }
 
+/// Read an image file as PNG bytes — pass-through when it already is a PNG,
+/// re-encode otherwise. Raw-mode photos keep their original format on disk,
+/// but the image-edits API is sent `image/png`.
+pub fn png_bytes_of(path: &Path) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Ok(bytes);
+    }
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("could not read image: {e}"))?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 /// Same pipeline for in-memory bytes (e.g. an AI-generated talking frame).
 pub fn process_and_store_bytes(
     bytes: &[u8],
@@ -884,6 +899,24 @@ mod tests {
             let c = out.get_pixel(out.width() / 2, out.height() / 2)[3];
             assert!(c > 0, "frame {n}: subject stays opaque");
         }
+    }
+
+    #[test]
+    fn png_bytes_of_passes_png_and_reencodes_the_rest() {
+        let dir = tmp_dir("png-of");
+        let img = RgbaImage::from_pixel(8, 8, image::Rgba([200, 150, 120, 255]));
+        let png_path = dir.join("a.png");
+        img.save(&png_path).unwrap();
+        let png = std::fs::read(&png_path).unwrap();
+        assert_eq!(png_bytes_of(&png_path).unwrap(), png, "png passes through");
+
+        let jpg_path = dir.join("a.jpg");
+        image::DynamicImage::ImageRgba8(img)
+            .to_rgb8()
+            .save(&jpg_path)
+            .unwrap();
+        let out = png_bytes_of(&jpg_path).unwrap();
+        assert!(out.starts_with(&[0x89, b'P', b'N', b'G']), "jpg → png");
     }
 
     #[test]

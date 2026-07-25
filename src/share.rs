@@ -155,7 +155,7 @@ pub fn import_into(
             )
         }),
         photo_mode: crate::config::PhotoMode::Auto,
-        talk_anim: crate::config::TalkAnim::Flap,
+        talk_anim: crate::config::TalkAnim::Jaw,
         idle_anim: crate::config::IdleAnim::Off,
         blink: true,
         accent: s.accent,

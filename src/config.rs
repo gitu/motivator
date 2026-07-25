@@ -67,6 +67,8 @@ pub enum PhotoMode {
     /// trust the image's own alpha channel; still resize + detect the mouth
     Precut,
     /// store the file untouched: no resize, no cut-out, no detection
+    /// (animated files are still decoded into bounded frames so they can
+    /// become textures)
     Raw,
 }
 
@@ -435,7 +437,7 @@ fn default_friends() -> Vec<Friend> {
             name: "marc".into(),
             photo: None,
             photo_mode: PhotoMode::Auto,
-            talk_anim: TalkAnim::Flap,
+            talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
             accent: Accent::Orange,
@@ -458,7 +460,7 @@ fn default_friends() -> Vec<Friend> {
             name: "ana".into(),
             photo: None,
             photo_mode: PhotoMode::Auto,
-            talk_anim: TalkAnim::Flap,
+            talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
             accent: Accent::Lime,
@@ -480,7 +482,7 @@ fn default_friends() -> Vec<Friend> {
             name: "coach k".into(),
             photo: None,
             photo_mode: PhotoMode::Auto,
-            talk_anim: TalkAnim::Flap,
+            talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
             accent: Accent::Violet,
@@ -596,7 +598,7 @@ mod tests {
         assert_eq!(back.friends[0].quotes.len(), 4);
         assert!(matches!(back.friends[0].expansion, Expansion::Remix));
         assert_eq!(back.friends[0].photo_mode, PhotoMode::Auto);
-        assert_eq!(back.friends[0].talk_anim, TalkAnim::Flap);
+        assert_eq!(back.friends[0].talk_anim, TalkAnim::Jaw);
         assert_eq!(back.friends[0].idle_anim, IdleAnim::Off);
         assert!(back.friends[0].photo.is_none());
         assert_eq!(back.schedule.len(), 3);

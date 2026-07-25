@@ -50,8 +50,7 @@ fn main() -> eframe::Result {
         let usage = "usage: --talkframe <cutout.png> <friend-id>";
         let (src, id) = (args.get(2).expect(usage), args.get(3).expect(usage));
         let cfg = config::Config::load();
-        let result = std::fs::read(src)
-            .map_err(|e| e.to_string())
+        let result = photo::png_bytes_of(std::path::Path::new(src))
             .and_then(|png| api::talk_frame(&cfg.api, &png))
             .and_then(|png| {
                 photo::process_and_store_bytes(

@@ -43,8 +43,9 @@ actually say — with a little talking animation. Teach it which lines land with
   via a brow-then-eye darkness search, chin and face extent from the box
 - **photo control** — pick per friend how uploads are processed: *auto
   cut-out*, *already cut out* (keeps your PNG's transparency, skips the flood
-  fill), or *keep as-is* (stored untouched, no resize, no detection); a mouth
-  line slider corrects the detected flap hinge when needed
+  fill), or *keep as-is* (stored untouched, no resize, no detection —
+  animated files are still decoded into frames); a mouth line slider
+  corrects the detected flap hinge when needed
 - **animation styles** — per friend: a talking style (mouth-warp *jaw*,
   flap, bounce, sway, two-frame swap, or none), a continuous idle animation
   (breathe, sway, or *alive*), and natural blinking on the detected eyes,

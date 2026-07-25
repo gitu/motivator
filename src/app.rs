@@ -429,7 +429,7 @@ impl MotivatorApp {
             name: "new friend".into(),
             photo: None,
             photo_mode: PhotoMode::Auto,
-            talk_anim: TalkAnim::Flap,
+            talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
             accent,
@@ -481,8 +481,9 @@ impl MotivatorApp {
         let ctx = ctx.clone();
         self.talk_gen_busy = true;
         std::thread::spawn(move || {
-            let result = std::fs::read(&photo.path)
-                .map_err(|e| e.to_string())
+            // raw-mode photos may be jpg/webp/gif on disk — the API part is
+            // declared image/png, so normalize first
+            let result = photo::png_bytes_of(&photo.path)
                 .and_then(|png| api::talk_frame(&api, &png))
                 .and_then(|png| {
                     photo::process_and_store_bytes(&png, Some("png"), &format!("{id}.talk"), mode)
