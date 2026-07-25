@@ -200,10 +200,7 @@ impl MotivatorApp {
     }
 
     fn placement(&self, monitor: Option<Vec2>) -> Corner {
-        match (self.cfg.pos, monitor) {
-            (Some((x, y)), Some(m)) if m.x > 1.0 && m.y > 1.0 => quadrant(Pos2::new(x, y), m),
-            _ => self.cfg.corner,
-        }
+        effective_corner(self.cfg.pos, self.cfg.corner, monitor)
     }
 
     fn active_idx(&self) -> usize {
@@ -772,12 +769,7 @@ impl MotivatorApp {
         let name = if f.name.is_empty() { "friend" } else { &f.name };
         let hover_id = ui.id().with("avatar");
 
-        // with a photo the cut-out head pops above and beside the tile
-        let alloc = if has_photo {
-            vec2(px * 1.20, px * 1.34)
-        } else {
-            vec2(px, px + 2.0)
-        };
+        let alloc = avatar_alloc(px, has_photo);
         let (rect, _) = ui.allocate_exact_size(alloc, Sense::hover());
         // a fixed id keeps the drag alive when crossing the screen's center
         // line mid-drag — the stack reflows and auto ids would change
@@ -894,9 +886,8 @@ impl MotivatorApp {
             if let (Some(grab), Some(o), Some(p)) =
                 (self.drag_grab, origin, resp.interact_pointer_pos())
             {
-                if self.drag_last_ptr != Some(p) {
+                if let Some(center) = drag_update(o, p, self.drag_last_ptr, grab) {
                     self.drag_last_ptr = Some(p);
-                    let center = o + p.to_vec2() - grab;
                     self.cfg.pos = Some((center.x, center.y));
                     self.mark_dirty();
                 }
@@ -942,12 +933,7 @@ impl MotivatorApp {
         // fixed row height — a height-unbounded child would bottom-align into
         // all remaining space and feed the window-size loop when the row sits
         // on top of the stack (top placements)
-        let px = self.cfg.avatar_size;
-        let row_h = if self.active().photo.is_some() {
-            px * 1.34
-        } else {
-            px + 2.0
-        };
+        let row_h = avatar_alloc(self.cfg.avatar_size, self.active().photo.is_some()).y;
         ui.allocate_ui_with_layout(vec2(ui.available_width(), row_h), layout, |ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             self.draw_avatar(ui, ctx);
@@ -1665,8 +1651,7 @@ impl MotivatorApp {
                 });
             // picking a corner snaps back from a dragged position
             if let Some(c) = snapped {
-                self.cfg.corner = c;
-                self.cfg.pos = None;
+                snap_to_corner(&mut self.cfg, c);
                 self.mark_dirty();
             }
         });
@@ -1787,25 +1772,7 @@ impl MotivatorApp {
         if m.x <= 1.0 || m.y <= 1.0 {
             return;
         }
-        // a dragged friend anchors the window on the avatar tile, so bubbles
-        // and panels grow around it; otherwise pin to the configured corner
-        let target = match (self.cfg.pos, self.avatar_rect) {
-            (Some((x, y)), Some(avatar)) => Pos2::new(x, y) - avatar.center().to_vec2(),
-            _ => {
-                let x = if self.cfg.corner.is_right() {
-                    m.x - desired.x - SCREEN_MARGIN + PAD
-                } else {
-                    SCREEN_MARGIN - PAD
-                };
-                let y = if self.cfg.corner.is_bottom() {
-                    m.y - desired.y - SCREEN_MARGIN + PAD
-                } else {
-                    SCREEN_MARGIN - PAD
-                };
-                Pos2::new(x, y)
-            }
-        };
-        let pos = clamp_to_monitor(target, desired, m);
+        let pos = anchor_target(self.cfg.pos, self.avatar_rect, self.cfg.corner, desired, m);
         let last = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
         let dragging = self.drag_grab.is_some();
         if dragging || changed || last.is_none_or(|l| (l - pos).abs().max_elem() > 2.0) {
@@ -1875,6 +1842,69 @@ fn quadrant(pos: Pos2, monitor: Vec2) -> Corner {
         (false, true) => Corner::BottomLeft,
         (true, false) => Corner::TopRight,
         (false, false) => Corner::TopLeft,
+    }
+}
+
+/// the quadrant of a dragged position, or the configured corner while no
+/// custom position is set (or the monitor is unknown/degenerate)
+fn effective_corner(pos: Option<(f32, f32)>, corner: Corner, monitor: Option<Vec2>) -> Corner {
+    match (pos, monitor) {
+        (Some((x, y)), Some(m)) if m.x > 1.0 && m.y > 1.0 => quadrant(Pos2::new(x, y), m),
+        _ => corner,
+    }
+}
+
+/// While dragging, the new avatar center for the current pointer — `None`
+/// when the pointer hasn't produced a fresh motion event. The window moving
+/// under a still pointer emits no X11 motion event, so a fresh origin with
+/// the stale window-local pointer must not move the avatar again (that
+/// feedback ran the window away 40px per frame).
+fn drag_update(origin: Pos2, ptr: Pos2, last_ptr: Option<Pos2>, grab: Vec2) -> Option<Pos2> {
+    (last_ptr != Some(ptr)).then(|| origin + ptr.to_vec2() - grab)
+}
+
+/// Where the window belongs: anchored on the avatar tile when a dragged
+/// position exists, else pinned to the configured corner — always clamped
+/// fully onto the monitor so growing panels never leave the screen.
+fn anchor_target(
+    pos: Option<(f32, f32)>,
+    avatar: Option<Rect>,
+    corner: Corner,
+    desired: Vec2,
+    monitor: Vec2,
+) -> Pos2 {
+    let target = match (pos, avatar) {
+        (Some((x, y)), Some(avatar)) => Pos2::new(x, y) - avatar.center().to_vec2(),
+        _ => {
+            let x = if corner.is_right() {
+                monitor.x - desired.x - SCREEN_MARGIN + PAD
+            } else {
+                SCREEN_MARGIN - PAD
+            };
+            let y = if corner.is_bottom() {
+                monitor.y - desired.y - SCREEN_MARGIN + PAD
+            } else {
+                SCREEN_MARGIN - PAD
+            };
+            Pos2::new(x, y)
+        }
+    };
+    clamp_to_monitor(target, desired, monitor)
+}
+
+fn snap_to_corner(cfg: &mut Config, corner: Corner) {
+    cfg.corner = corner;
+    cfg.pos = None;
+}
+
+/// avatar allocation — with a photo the cut-out head pops above and beside
+/// the tile. `avatar_row` reserves exactly this height; if the two drift
+/// apart the height-unbounded row feeds the window-size loop again.
+fn avatar_alloc(px: f32, has_photo: bool) -> Vec2 {
+    if has_photo {
+        vec2(px * 1.20, px * 1.34)
+    } else {
+        vec2(px, px + 2.0)
     }
 }
 
@@ -2140,6 +2170,116 @@ mod tests {
             clamp_to_monitor(Pos2::new(10.0, 10.0), vec2(4000.0, 4000.0), m),
             Pos2::ZERO
         );
+    }
+
+    #[test]
+    fn drag_update_needs_a_fresh_motion_event() {
+        let origin = Pos2::new(100.0, 100.0);
+        let ptr = Pos2::new(30.0, 40.0);
+        let grab = vec2(4.0, -2.0);
+        // fresh event: absolute reconstruction origin + ptr − grab
+        assert_eq!(
+            drag_update(origin, ptr, None, grab),
+            Some(Pos2::new(126.0, 142.0))
+        );
+        assert_eq!(
+            drag_update(origin, ptr, Some(Pos2::new(30.0, 39.0)), grab),
+            Some(Pos2::new(126.0, 142.0))
+        );
+        // runaway regression: the window moved (fresh origin) but the pointer
+        // produced no new event — the avatar must stay put
+        assert_eq!(
+            drag_update(Pos2::new(60.0, 100.0), ptr, Some(ptr), grab),
+            None
+        );
+    }
+
+    #[test]
+    fn anchor_targets_avatar_when_dragged_else_corner() {
+        let m = vec2(640.0, 560.0);
+        let desired = vec2(342.0, 274.0);
+        let avatar = Rect::from_min_size(Pos2::new(200.0, 150.0), vec2(96.0, 96.0));
+        // avatar-anchored: window pos = stored center − avatar offset in window
+        assert_eq!(
+            anchor_target(
+                Some((300.0, 300.0)),
+                Some(avatar),
+                Corner::TopLeft,
+                desired,
+                m
+            ),
+            Pos2::new(300.0 - 248.0, 300.0 - 198.0)
+        );
+        // first frames: no avatar rect yet → corner math
+        assert_eq!(
+            anchor_target(Some((300.0, 300.0)), None, Corner::BottomRight, desired, m),
+            Pos2::new(
+                640.0 - 342.0 - SCREEN_MARGIN + PAD,
+                560.0 - 274.0 - SCREEN_MARGIN + PAD
+            )
+        );
+        // smart-config regression: a config-panel-sized window opened at the
+        // bottom edge clamps fully on-screen instead of hanging off
+        let tall = vec2(362.0, 562.0);
+        let t = anchor_target(
+            Some((183.0, 522.0)),
+            Some(avatar),
+            Corner::BottomLeft,
+            tall,
+            m,
+        );
+        assert_eq!(t.y, 0.0);
+        assert!(t.x >= 0.0 && t.x + tall.x <= m.x);
+        // corner mode clamps too: taller-than-screen panel at a top corner
+        assert_eq!(
+            anchor_target(None, None, Corner::TopLeft, tall, m),
+            Pos2::new(SCREEN_MARGIN - PAD, 0.0)
+        );
+    }
+
+    #[test]
+    fn effective_corner_falls_back_to_configured() {
+        let m = Some(vec2(1920.0, 1080.0));
+        assert!(matches!(
+            effective_corner(None, Corner::BottomLeft, m),
+            Corner::BottomLeft
+        ));
+        assert!(matches!(
+            effective_corner(Some((10.0, 10.0)), Corner::BottomRight, None),
+            Corner::BottomRight
+        ));
+        // headless/first frames can report a degenerate monitor
+        assert!(matches!(
+            effective_corner(
+                Some((10.0, 10.0)),
+                Corner::BottomRight,
+                Some(vec2(0.0, 0.0))
+            ),
+            Corner::BottomRight
+        ));
+        assert!(matches!(
+            effective_corner(Some((10.0, 10.0)), Corner::BottomRight, m),
+            Corner::TopLeft
+        ));
+    }
+
+    #[test]
+    fn snap_to_corner_clears_dragged_position() {
+        let mut cfg = Config {
+            pos: Some((5.0, 5.0)),
+            ..Default::default()
+        };
+        // re-picking the already-configured corner must still snap back
+        let same = cfg.corner;
+        snap_to_corner(&mut cfg, same);
+        assert!(cfg.pos.is_none());
+        assert!(matches!(cfg.corner, Corner::BottomRight));
+    }
+
+    #[test]
+    fn avatar_alloc_covers_both_variants() {
+        assert_eq!(avatar_alloc(96.0, true), vec2(96.0 * 1.20, 96.0 * 1.34));
+        assert_eq!(avatar_alloc(68.0, false), vec2(68.0, 70.0));
     }
 
     #[test]
