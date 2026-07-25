@@ -10,6 +10,7 @@ use egui::{
 use crate::api::{self, ApiEvent};
 use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc, Theme};
 use crate::photo;
+use crate::share;
 use crate::theme::{self, Palette};
 
 /// margin inside the (transparent) window so panel shadows aren't clipped
@@ -44,6 +45,12 @@ struct Bubble {
     deadline: Instant,
 }
 
+/// results of friend-card work done off the UI thread (file dialogs)
+enum ShareEvent {
+    Import(Result<(share::SharedFriend, Option<Vec<u8>>), String>),
+    Note(String),
+}
+
 pub fn initial_size(_cfg: &Config) -> [f32; 2] {
     [300.0, 180.0]
 }
@@ -72,11 +79,17 @@ pub struct MotivatorApp {
     gen_busy: bool,
     api_note: String,
     photo_note: String,
+    share_note: String,
 
     api_rx: Receiver<ApiEvent>,
     api_tx: Sender<ApiEvent>,
     photo_rx: Receiver<(String, Result<photo::Processed, String>)>,
     photo_tx: Sender<(String, Result<photo::Processed, String>)>,
+    share_rx: Receiver<ShareEvent>,
+    share_tx: Sender<ShareEvent>,
+    /// kept for the app's lifetime — on X11 clipboard contents vanish when the
+    /// owning `Clipboard` is dropped
+    clip: Option<arboard::Clipboard>,
 
     textures: HashMap<String, egui::TextureHandle>,
     last_applied_theme: Option<Theme>,
@@ -94,6 +107,7 @@ impl MotivatorApp {
     fn from_config(cfg: Config) -> Self {
         let (api_tx, api_rx) = channel();
         let (photo_tx, photo_rx) = channel();
+        let (share_tx, share_rx) = channel();
         MotivatorApp {
             cfg,
             dirty_since: None,
@@ -114,10 +128,14 @@ impl MotivatorApp {
             gen_busy: false,
             api_note: String::new(),
             photo_note: String::new(),
+            share_note: String::new(),
             api_rx,
             api_tx,
             photo_rx,
             photo_tx,
+            share_rx,
+            share_tx,
+            clip: None,
             textures: HashMap::new(),
             last_applied_theme: None,
         }
@@ -347,6 +365,132 @@ impl MotivatorApp {
         });
     }
 
+    fn clipboard(&mut self) -> Result<&mut arboard::Clipboard, String> {
+        if self.clip.is_none() {
+            self.clip = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        Ok(self.clip.as_mut().unwrap())
+    }
+
+    fn encode_active_card(&self) -> Result<image::RgbaImage, String> {
+        let f = self.active();
+        let accent = self.pal().accent_color(f.accent);
+        share::encode_card(f, [accent.r(), accent.g(), accent.b()])
+    }
+
+    fn share_copy(&mut self) {
+        let card = match self.encode_active_card() {
+            Ok(c) => c,
+            Err(e) => {
+                self.share_note = e;
+                return;
+            }
+        };
+        let data = arboard::ImageData {
+            width: card.width() as usize,
+            height: card.height() as usize,
+            bytes: card.into_raw().into(),
+        };
+        self.share_note = match self
+            .clipboard()
+            .and_then(|c| c.set_image(data).map_err(|e| e.to_string()))
+        {
+            Ok(()) => "card copied — paste it anywhere".into(),
+            Err(e) => format!("clipboard failed: {e}"),
+        };
+    }
+
+    fn share_save(&mut self, ctx: &egui::Context) {
+        let card = match self.encode_active_card() {
+            Ok(c) => c,
+            Err(e) => {
+                self.share_note = e;
+                return;
+            }
+        };
+        let name = self.active().name.replace(char::is_whitespace, "-");
+        let tx = self.share_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("save friend card")
+                .set_file_name(format!("{name}-card.png"))
+                .add_filter("png image", &["png"])
+                .save_file()
+            {
+                // always PNG regardless of typed extension — a lossy format
+                // would destroy the embedded config
+                let note = match card.save_with_format(&path, image::ImageFormat::Png) {
+                    Ok(()) => format!("card saved to {}", path.display()),
+                    Err(e) => format!("save failed: {e}"),
+                };
+                let _ = tx.send(ShareEvent::Note(note));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn share_paste(&mut self) {
+        let img = match self
+            .clipboard()
+            .and_then(|c| c.get_image().map_err(|e| e.to_string()))
+        {
+            Ok(i) => i,
+            Err(_) => {
+                self.share_note = "no image in the clipboard".into();
+                return;
+            }
+        };
+        let Some(rgba) =
+            image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+        else {
+            self.share_note = "clipboard image was malformed".into();
+            return;
+        };
+        match share::decode_card(&rgba) {
+            Ok((s, photo)) => self.import_shared(s, photo),
+            Err(e) => self.share_note = e,
+        }
+    }
+
+    fn share_open(&mut self, ctx: &egui::Context) {
+        let tx = self.share_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("open a friend card")
+                .add_filter("png image", &["png"])
+                .pick_file()
+            {
+                let result = image::open(&path)
+                    .map_err(|e| format!("could not read image: {e}"))
+                    .and_then(|img| share::decode_card(&img.to_rgba8()));
+                let _ = tx.send(ShareEvent::Import(result));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn import_shared(&mut self, s: share::SharedFriend, photo_png: Option<Vec<u8>>) {
+        let name = if s.name.is_empty() {
+            "friend".to_string()
+        } else {
+            s.name.clone()
+        };
+        match share::import_into(&mut self.cfg, s, photo_png) {
+            Ok(_) => {
+                self.share_note = format!("imported {name}");
+                self.panel = Some(Panel::Config);
+                self.tab = Tab::Friend;
+                self.bubble = None;
+                self.chat.clear();
+                self.next_nudge = None;
+                self.mark_dirty();
+            }
+            Err(e) => self.share_note = e,
+        }
+    }
+
     fn drain_events(&mut self) {
         while let Ok(ev) = self.api_rx.try_recv() {
             match ev {
@@ -391,6 +535,13 @@ impl MotivatorApp {
                         Err(e) => format!("failed: {e}"),
                     }
                 }
+            }
+        }
+        while let Ok(ev) = self.share_rx.try_recv() {
+            match ev {
+                ShareEvent::Note(n) => self.share_note = n,
+                ShareEvent::Import(Ok((s, photo))) => self.import_shared(s, photo),
+                ShareEvent::Import(Err(e)) => self.share_note = e,
             }
         }
         while let Ok((id, result)) = self.photo_rx.try_recv() {
@@ -903,6 +1054,8 @@ impl MotivatorApp {
         let mut pick: Option<String> = None;
         let mut del: Option<String> = None;
         let mut add = false;
+        let mut paste = false;
+        let mut open = false;
         self.panel_frame()
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
@@ -993,6 +1146,18 @@ impl MotivatorApp {
                             .min_size(vec2(236.0, 30.0)),
                         )
                         .clicked();
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(self.label_text("got a friend card?"));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            open = self.tiny_button(ui, "open card…").clicked();
+                            paste = self.tiny_button(ui, "paste card").clicked();
+                        });
+                    });
+                    if !self.share_note.is_empty() {
+                        let note = self.share_note.clone();
+                        ui.label(self.label_text(&note));
+                    }
                 })
             });
         if close {
@@ -1006,6 +1171,12 @@ impl MotivatorApp {
         }
         if add {
             self.add_friend();
+        }
+        if paste {
+            self.share_paste();
+        }
+        if open {
+            self.share_open(ctx);
         }
     }
 
@@ -1149,6 +1320,41 @@ impl MotivatorApp {
                 self.active_mut().accent = a;
             }
         });
+        ui.label(
+            RichText::new("share")
+                .font(theme::font_ui())
+                .color(pal.foreground),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("copy card").font(theme::font_ui()),
+                ))
+                .clicked()
+            {
+                self.share_copy();
+            }
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("save card…").font(theme::font_ui()),
+                ))
+                .clicked()
+            {
+                self.share_save(ctx);
+            }
+        });
+        ui.label(self.label_text(
+            "a png of them with their whole config inside — import via friends → paste card",
+        ));
+        if !self.share_note.is_empty() {
+            let note = self.share_note.clone();
+            ui.label(
+                RichText::new(note)
+                    .font(theme::font_label())
+                    .color(pal.foreground),
+            );
+        }
     }
 
     fn tab_quotes(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

@@ -1929,6 +1929,7 @@ dependencies = [
 name = "motivator"
 version = "0.0.0"
 dependencies = [
+ "arboard",
  "dirs",
  "eframe",
  "egui",
