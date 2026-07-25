@@ -162,6 +162,9 @@ impl Default for ApiConfig {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub corner: Corner,
+    /// avatar tile center in screen px after drag-and-drop; None = pin to `corner`
+    #[serde(default)]
+    pub pos: Option<(f32, f32)>,
     /// avatar edge length in logical px (design range 56..=96)
     pub avatar_size: f32,
     /// how long a bubble stays up after talking
@@ -192,6 +195,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             corner: Corner::BottomRight,
+            pos: None,
             avatar_size: 68.0,
             bubble_secs: 8.0,
             gen_count: 3,
@@ -369,11 +373,15 @@ mod tests {
 
     #[test]
     fn config_serde_roundtrip() {
-        let cfg = Config::default();
+        let cfg = Config {
+            pos: Some((120.5, 640.0)),
+            ..Default::default()
+        };
         let back = cfg.roundtrip();
         assert_eq!(back.friends.len(), cfg.friends.len());
         assert_eq!(back.active, "marc");
         assert!(back.prefer_x11);
+        assert_eq!(back.pos, Some((120.5, 640.0)));
         assert_eq!(back.friends[0].quotes.len(), 4);
         assert!(matches!(back.friends[0].expansion, Expansion::Remix));
         assert_eq!(back.schedule.len(), 3);
@@ -432,6 +440,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.prefer_x11);
         assert_eq!(cfg.gen_count, 3);
+        assert_eq!(cfg.pos, None);
         assert_eq!(cfg.friends[0].split, 0.52);
         assert!(cfg.friends[0].pool.is_empty());
         // schedule arrived later still: existing configs keep an empty
