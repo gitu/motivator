@@ -109,7 +109,8 @@ of your friend with their entire config (name, quotes and learned weights,
 accent, behavior, and the cut-out photo) steganographically embedded in the
 pixels' low bits. **save card…** writes the same PNG to disk. The recipient
 imports it via **friends → paste card** (or **open card…**) and gets the
-friend exactly as trained. The API key is never part of a card.
+friend exactly as trained. Your LLM settings — API url, token, and model —
+are global config, not friend data, and are never part of a card.
 
 Because the data lives in the pixels, it survives clipboard round-trips and
 PNG re-saves — but **not** lossy paths: screenshots of the card, resizing, or

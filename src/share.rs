@@ -25,7 +25,10 @@ const CARD: u32 = 512;
 const SHARE_PHOTO: u32 = 256;
 
 /// Everything that defines a friend except its local id and photo path.
-/// The photo travels beside it as raw PNG bytes.
+/// The photo travels beside it as raw PNG bytes. The LLM endpoint settings
+/// (`Config.api`: base url, token, model) are global config, not part of the
+/// friend — they never enter a card, only the friend's own texts and
+/// behavior do.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedFriend {
     pub name: String,
@@ -319,6 +322,40 @@ mod tests {
         assert!(photo.is_none());
         // card must be fully opaque so clipboard alpha handling can't hurt it
         assert!(card.pixels().all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn card_payload_never_carries_api_config() {
+        // the llm endpoint settings (base url, token, model) are global
+        // config, not friend data — pin the payload's exact key set so they
+        // can't sneak into a card
+        let card = encode_card(&friend(None), [80, 200, 255]).unwrap();
+        let bytes = extract_all(&card);
+        let json_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+        let payload: serde_json::Value = serde_json::from_slice(&bytes[9..9 + json_len]).unwrap();
+        let mut keys: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "accent",
+                "expansion",
+                "interval_secs",
+                "name",
+                "nudges",
+                "pool",
+                "quotes",
+                "split"
+            ]
+        );
+        for leak in ["api", "api_key", "base_url", "model"] {
+            assert!(payload.get(leak).is_none(), "{leak} must not be in a card");
+        }
     }
 
     #[test]
