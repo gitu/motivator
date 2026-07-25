@@ -61,9 +61,15 @@ fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
         .iter()
         .max_by_key(|f| f.bbox().width() * f.bbox().height())?;
     let bbox = best.bbox();
+    let mouth_y = bbox.y() as f32 + bbox.height() as f32 * 0.74;
+    let refined = snap_above_teeth(
+        img,
+        (bbox.x(), bbox.y(), bbox.width(), bbox.height()),
+        mouth_y,
+    );
     if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
         eprintln!(
-            "face bbox: x={} y={} w={} h={} (image {}x{})",
+            "face bbox: x={} y={} w={} h={} (image {}x{}) mouth_y={mouth_y:.1} refined={refined:.1}",
             bbox.x(),
             bbox.y(),
             bbox.width(),
@@ -72,8 +78,69 @@ fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
             img.height()
         );
     }
-    let mouth_y = bbox.y() as f32 + bbox.height() as f32 * 0.74;
-    Some((mouth_y / img.height() as f32).clamp(0.3, 0.85))
+    Some((refined / img.height() as f32).clamp(0.3, 0.85))
+}
+
+/// If teeth are visible (a smile), a split through them puts teeth on both
+/// flap slices — creepy in motion. Look for the teeth band (bright, low
+/// chroma rows in the central strip of the face) around the candidate mouth
+/// line and snap the split to just above it, so the whole set of teeth stays
+/// on the static bottom slice and the lifting top reads as the upper lip.
+fn snap_above_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) -> f32 {
+    let (bx, _by, bw, bh) = bbox;
+    let win = 0.12 * bh as f32;
+    let y_lo = (mouth_y - win).max(0.0) as u32;
+    let y_hi = ((mouth_y + win) as u32).min(img.height().saturating_sub(1));
+    // central half of the face box — teeth live there, collars/ears don't
+    let x_lo = (bx + bw as i32 / 4).clamp(0, img.width() as i32 - 1) as u32;
+    let x_hi = (bx + (bw as i32 * 3) / 4).clamp(0, img.width() as i32 - 1) as u32;
+    if y_lo >= y_hi || x_lo >= x_hi {
+        return mouth_y;
+    }
+    let toothy: Vec<bool> = (y_lo..=y_hi)
+        .map(|y| {
+            let n = (x_lo..=x_hi)
+                .filter(|&x| {
+                    let p = img.get_pixel(x, y);
+                    let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+                    let mx = r.max(g).max(b);
+                    let mn = r.min(g).min(b);
+                    // bright and near-neutral — teeth, not (warm) skin or lips
+                    p[3] > 128 && mx > 130 && mx - mn < 45
+                })
+                .count();
+            n as u32 * 8 > x_hi - x_lo // ≥ 12.5% of the strip width
+        })
+        .collect();
+    // longest contiguous toothy run; require a couple of rows to avoid
+    // snapping to specular highlights
+    let (mut best_start, mut best_len) = (0usize, 0usize);
+    let (mut run_start, mut run_len) = (0usize, 0usize);
+    for (i, &t) in toothy.iter().enumerate() {
+        if t {
+            if run_len == 0 {
+                run_start = i;
+            }
+            run_len += 1;
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+    if best_len < 2.max((0.015 * bh as f32) as usize) {
+        return mouth_y; // no teeth visible (closed mouth) — keep the estimate
+    }
+    if best_len as f32 > 0.08 * bh as f32 {
+        return mouth_y; // far too tall for teeth — pale skin, not a mouth
+    }
+    let band_top = y_lo as f32 + best_start as f32;
+    if band_top < mouth_y - 0.06 * bh as f32 || band_top > mouth_y + 0.12 * bh as f32 {
+        return mouth_y; // stray highlight away from the mouth line
+    }
+    (band_top - 0.015 * bh as f32).max(0.0)
 }
 
 /// Remove the background by flood-filling from the top/left/right borders,
@@ -313,6 +380,32 @@ mod tests {
         assert_eq!(out.get_pixel(1, 1)[3], 0);
         assert!(out.get_pixel(out.width() / 2, out.height() / 2)[3] > 0);
         assert!((0.3..=0.78).contains(&p.split), "split={}", p.split);
+    }
+
+    #[test]
+    fn split_snaps_above_visible_teeth() {
+        // warm "skin" face with a bright neutral teeth band at y=44..48
+        let mut img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        for y in 44..48 {
+            for x in 35..65 {
+                img.put_pixel(x, y, image::Rgba([230, 228, 225, 255]));
+            }
+        }
+        let bbox = (10, 0, 80u32, 90u32);
+        // candidate line mid-teeth (y=46) must snap above the band
+        let snapped = snap_above_teeth(&img, bbox, 46.0);
+        assert!(
+            snapped < 44.0,
+            "split {snapped} should sit above the teeth band at y=44"
+        );
+        assert!(snapped > 38.0, "split {snapped} should stay near the mouth");
+    }
+
+    #[test]
+    fn split_unchanged_without_teeth() {
+        // closed mouth: uniform warm skin, no bright neutral band
+        let img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        assert_eq!(snap_above_teeth(&img, (10, 0, 80, 90), 46.0), 46.0);
     }
 
     #[test]
