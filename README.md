@@ -35,9 +35,9 @@ actually say — with a little talking animation. Teach it which lines land with
   (flood fill from the borders) and the mouth is located by real face
   detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
   fallback) so the head's top half can flap while talking, jaw-snap style
-- **friend cards** — share a friend as a PNG with their name, lines, and
-  photo embedded in the pixels; copy/paste or send as a file, import via
-  friends → paste card
+- **friend cards** — share a friend as a PNG with their whole config (quotes,
+  weights, photo, behavior) embedded in the pixels; copy/paste or send as a
+  file, import via friends → paste card
 - **sizes** — avatar size 56–96 px, bubble duration, corner, dark/light theme,
   all in config → behavior
 
@@ -101,13 +101,12 @@ may contain the token). Processed photos live in
 ## sharing friends
 
 **config → friend → copy card** puts a *friend card* on the clipboard — a PNG
-of your friend with who they are and what they say (name, quote and pool
-texts, accent, and the cut-out photo) steganographically embedded in the
+of your friend with their entire config (name, quotes and learned weights,
+accent, behavior, and the cut-out photo) steganographically embedded in the
 pixels' low bits. **save card…** writes the same PNG to disk. The recipient
-imports it via **friends → paste card** (or **open card…**). Only the texts
-travel: your learned weights, nudge schedule, and every AI/LLM setting (API
-key, endpoint, model, expansion mode) stay on your machine — the imported
-friend starts with those at their defaults.
+imports it via **friends → paste card** (or **open card…**) and gets the
+friend exactly as trained. Your LLM settings — API url, token, and model —
+are global config, not friend data, and are never part of a card.
 
 Because the data lives in the pixels, it survives clipboard round-trips and
 PNG re-saves — but **not** lossy paths: screenshots of the card, resizing, or
