@@ -330,6 +330,14 @@ mod tests {
     }
 
     #[test]
+    fn theme_is_no_longer_a_config_field() {
+        // the palette follows the system preference now — a saved config
+        // must not resurrect the old per-app theme choice
+        let json = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!json.contains("\"theme\""));
+    }
+
+    #[test]
     fn old_config_without_new_fields_still_loads() {
         // simulates a config written before prefer_x11 / split / pool existed
         // (and after theme was still a config field — now ignored)
