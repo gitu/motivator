@@ -58,9 +58,13 @@ pub struct MotivatorApp {
     /// avatar tile in window coords, recorded during layout so the window
     /// can be anchored on the avatar afterwards
     avatar_rect: Option<Rect>,
-    /// screen-space offset between the pointer and the avatar center while a
-    /// drag is in flight
+    /// offset between the pointer and the avatar center while a drag is in
+    /// flight
     drag_grab: Option<Vec2>,
+    /// window-local pointer at the last applied drag update. The window moving
+    /// under a still pointer produces no motion event, so a fresh origin with
+    /// a stale pointer must not move the avatar again (feedback runaway).
+    drag_last_ptr: Option<Pos2>,
 
     panel: Option<Panel>,
     tab: Tab,
@@ -104,6 +108,7 @@ impl MotivatorApp {
             place,
             avatar_rect: None,
             drag_grab: None,
+            drag_last_ptr: None,
             panel: None,
             tab: Tab::Friend,
             bubble: None,
@@ -599,7 +604,10 @@ impl MotivatorApp {
         } else {
             vec2(px, px + 2.0)
         };
-        let (rect, resp) = ui.allocate_exact_size(alloc, Sense::click_and_drag());
+        let (rect, _) = ui.allocate_exact_size(alloc, Sense::hover());
+        // a fixed id keeps the drag alive when crossing the screen's center
+        // line mid-drag — the stack reflows and auto ids would change
+        let resp = ui.interact(rect, egui::Id::new("avatar-drag"), Sense::click_and_drag());
         let cursor = if resp.dragged() {
             egui::CursorIcon::Grabbing
         } else {
@@ -701,6 +709,7 @@ impl MotivatorApp {
         if resp.drag_started() {
             if origin.is_some() {
                 self.drag_grab = resp.interact_pointer_pos().map(|p| p - anchor.center());
+                self.drag_last_ptr = resp.interact_pointer_pos();
             } else {
                 // native Wayland never reports the window position — hand the
                 // move to the compositor instead (position won't persist)
@@ -711,13 +720,17 @@ impl MotivatorApp {
             if let (Some(grab), Some(o), Some(p)) =
                 (self.drag_grab, origin, resp.interact_pointer_pos())
             {
-                let center = o + p.to_vec2() - grab;
-                self.cfg.pos = Some((center.x, center.y));
-                self.mark_dirty();
+                if self.drag_last_ptr != Some(p) {
+                    self.drag_last_ptr = Some(p);
+                    let center = o + p.to_vec2() - grab;
+                    self.cfg.pos = Some((center.x, center.y));
+                    self.mark_dirty();
+                }
             }
         }
         if resp.drag_stopped() {
             self.drag_grab = None;
+            self.drag_last_ptr = None;
         }
 
         if resp.clicked() {
@@ -737,7 +750,16 @@ impl MotivatorApp {
         } else {
             Layout::left_to_right(Align::BOTTOM)
         };
-        ui.with_layout(layout, |ui| {
+        // fixed row height — a height-unbounded child would bottom-align into
+        // all remaining space and feed the window-size loop when the row sits
+        // on top of the stack (top placements)
+        let px = self.cfg.avatar_size;
+        let row_h = if self.active().photo.is_some() {
+            px * 1.34
+        } else {
+            px + 2.0
+        };
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), row_h), layout, |ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             self.draw_avatar(ui, ctx);
             ui.add_space(4.0);
@@ -1704,6 +1726,11 @@ impl eframe::App for MotivatorApp {
         self.drain_events();
         self.tick_timers();
 
+        // a drag can die without drag_stopped (e.g. focus loss) — don't stay
+        // in forced-reposition mode once the button is up
+        if self.drag_grab.is_some() && !ctx.input(|i| i.pointer.any_down()) {
+            self.drag_grab = None;
+        }
         self.place = self.placement(ctx.input(|i| i.viewport().monitor_size));
         let layout = if self.place.is_right() {
             Layout::top_down(Align::Max)
