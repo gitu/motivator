@@ -44,6 +44,10 @@ tar xzf "${tmp}/${asset}" -C "$tmp"
 mkdir -p "$install_dir"
 install -m 755 "${tmp}/motivator" "${install_dir}/motivator"
 if [ "$os" = macos ]; then
+  # Releases are not code-signed yet, so macOS quarantines the downloaded
+  # binary and Gatekeeper refuses to launch it. If you install by hand
+  # instead, clear the flag yourself:
+  #   xattr -d com.apple.quarantine motivator
   xattr -d com.apple.quarantine "${install_dir}/motivator" 2>/dev/null || true
 fi
 
