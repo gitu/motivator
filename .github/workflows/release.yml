@@ -36,9 +36,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The release tag must match the version committed in Cargo.toml — the
-      # binary reports the Cargo version, so a mismatch would ship a lie.
-      - name: Verify tag matches Cargo.toml version
+      # The git tag is the single source of truth for the release version —
+      # it is written into Cargo.toml before the build, so no version-bump
+      # commit is needed. The in-repo Cargo.toml stays at 0.0.0.
+      - name: Set version from tag
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -46,11 +47,8 @@ jobs:
             echo "Tag '$GITHUB_REF_NAME' is not a vX.Y.Z release tag" >&2
             exit 1
           fi
-          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "Tag $VERSION != Cargo.toml $CARGO_VERSION — bump Cargo.toml first" >&2
-            exit 1
-          fi
+          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          rm Cargo.toml.bak
 
       - uses: dtolnay/rust-toolchain@stable
         with:
