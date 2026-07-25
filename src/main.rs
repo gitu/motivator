@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod config;
 mod photo;
+mod schedule;
 mod share;
 mod theme;
 

@@ -10,6 +10,7 @@ use egui::{
 use crate::api::{self, ApiEvent};
 use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc};
 use crate::photo;
+use crate::schedule;
 use crate::share;
 use crate::theme::{self, Palette};
 
@@ -31,6 +32,7 @@ enum Tab {
     Friend,
     Quotes,
     Behavior,
+    Schedule,
     Api,
 }
 
@@ -80,6 +82,14 @@ pub struct MotivatorApp {
     note: Option<(String, Instant)>,
     speak_start: Option<Instant>,
     next_nudge: Option<Instant>,
+
+    /// window the schedule resolved to last tick (outer None = not yet
+    /// evaluated; inner = index into cfg.schedule, or none active)
+    last_sched_target: Option<Option<usize>>,
+    /// a hand-picked friend holds until the next schedule boundary
+    manual_override: bool,
+    /// the wall clock only needs reading about once a second
+    last_sched_check: Option<Instant>,
 
     chat: Vec<ChatMsg>,
     chat_draft: String,
@@ -147,6 +157,9 @@ impl MotivatorApp {
             note: None,
             speak_start: None,
             next_nudge: None,
+            last_sched_target: None,
+            manual_override: false,
+            last_sched_check: None,
             chat: Vec::new(),
             chat_draft: String::new(),
             typing: false,
@@ -346,20 +359,33 @@ impl MotivatorApp {
         }
     }
 
-    fn pick_friend(&mut self, id: &str) {
-        if id == self.cfg.active {
-            self.panel = None;
-            return;
-        }
+    /// make `id` the active friend and reset everything that belongs to one
+    /// friend (chat, bubble, nudge timer) — shared by hand picks and the
+    /// schedule
+    fn switch_friend(&mut self, id: &str) {
         self.cfg.active = id.to_string();
         self.chat.clear();
         self.typing = false;
         self.pending_reply = None;
         self.bubble = None;
         self.next_nudge = None;
-        self.panel = None;
         self.mark_dirty();
         self.speak();
+    }
+
+    /// a friend was picked by hand — the schedule backs off until its next
+    /// window boundary
+    fn note_manual_pick(&mut self) {
+        self.manual_override = self.cfg.schedule_enabled;
+    }
+
+    fn pick_friend(&mut self, id: &str) {
+        self.panel = None;
+        if id == self.cfg.active {
+            return;
+        }
+        self.note_manual_pick();
+        self.switch_friend(id);
     }
 
     fn add_friend(&mut self) {
@@ -389,6 +415,7 @@ impl MotivatorApp {
         self.bubble = None;
         self.chat.clear();
         self.next_nudge = None;
+        self.note_manual_pick();
         self.mark_dirty();
     }
 
@@ -402,6 +429,7 @@ impl MotivatorApp {
             self.bubble = None;
             self.chat.clear();
             self.next_nudge = None;
+            self.note_manual_pick();
         }
         self.mark_dirty();
     }
@@ -543,6 +571,9 @@ impl MotivatorApp {
                 self.bubble = None;
                 self.chat.clear();
                 self.next_nudge = None;
+                // importing switches to the new friend — don't let a running
+                // window instantly switch away again
+                self.note_manual_pick();
                 self.mark_dirty();
             }
             Err(e) => self.share_note = e,
@@ -640,6 +671,20 @@ impl MotivatorApp {
                 self.speak_start = None;
             }
         }
+        if self.cfg.schedule_enabled {
+            let due = self
+                .last_sched_check
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
+            if due {
+                self.last_sched_check = Some(now);
+                let (day, minutes) = local_day_minutes();
+                self.apply_schedule(day, minutes);
+            }
+        } else {
+            self.last_sched_target = None;
+            self.manual_override = false;
+            self.last_sched_check = None;
+        }
         let f = self.active();
         if f.nudges {
             let interval = Duration::from_secs(f.interval_secs.max(5));
@@ -660,6 +705,34 @@ impl MotivatorApp {
                 self.dirty_since = None;
             }
         }
+    }
+
+    /// Evaluate the schedule at (day 0 = mon … 6 = sun, minutes since
+    /// midnight) and switch the active friend if a window says so. Kept
+    /// clock-free so tests can walk through a day.
+    fn apply_schedule(&mut self, day: u8, minutes: u16) {
+        let target = schedule::resolve(&self.cfg.schedule, day, minutes);
+        let (switch, manual, last) =
+            schedule_step(self.last_sched_target, target, self.manual_override);
+        self.manual_override = manual;
+        self.last_sched_target = last;
+        if !switch {
+            return;
+        }
+        let Some(idx) = target else { return };
+        let id = self.cfg.schedule[idx].friend.clone();
+        // entries pointing at a deleted friend simply never fire
+        if id != self.cfg.active && self.cfg.friends.iter().any(|f| f.id == id) {
+            self.switch_friend(&id);
+        }
+    }
+
+    /// the schedule was edited — re-evaluate from scratch on the next tick
+    /// (stored window indices may have shifted)
+    fn reset_schedule_state(&mut self) {
+        self.last_sched_target = None;
+        self.manual_override = false;
+        self.last_sched_check = None;
     }
 
     fn texture(&mut self, ctx: &egui::Context, friend_idx: usize) -> Option<egui::TextureHandle> {
@@ -696,6 +769,27 @@ impl MotivatorApp {
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::NONE),
         )
+    }
+
+    /// tiny weekday toggle for schedule rows — filled while the day is on
+    fn day_toggle(&self, ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+        let pal = self.pal();
+        let (bg, fg) = if on {
+            (pal.accent, pal.foreground)
+        } else {
+            (Color32::TRANSPARENT, pal.muted_fg)
+        };
+        ui.add(
+            egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
+                .fill(bg)
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if on { pal.border } else { Color32::TRANSPARENT },
+                ))
+                .corner_radius(CornerRadius::same(5))
+                .min_size(vec2(16.0, 16.0)),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
     fn panel_frame(&self) -> egui::Frame {
@@ -1301,6 +1395,7 @@ impl MotivatorApp {
                     (Tab::Friend, "friend"),
                     (Tab::Quotes, "quotes"),
                     (Tab::Behavior, "behavior"),
+                    (Tab::Schedule, "schedule"),
                     (Tab::Api, "api"),
                 ];
                 egui::Frame::new()
@@ -1310,7 +1405,7 @@ impl MotivatorApp {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
                         ui.horizontal(|ui| {
-                            let w = (294.0 - 6.0 - 9.0) / 4.0;
+                            let w = (294.0 - 6.0 - 12.0) / 5.0;
                             for (tab, label) in tabs {
                                 let active = self.tab == tab;
                                 let (bg, fg) = if active {
@@ -1338,6 +1433,7 @@ impl MotivatorApp {
                     Tab::Friend => self.tab_friend(ui, ctx),
                     Tab::Quotes => self.tab_quotes(ui, ctx),
                     Tab::Behavior => self.tab_behavior(ui),
+                    Tab::Schedule => self.tab_schedule(ui),
                     Tab::Api => self.tab_api(ui, ctx),
                 }
             })
@@ -1681,6 +1777,152 @@ impl MotivatorApp {
         }
     }
 
+    fn tab_schedule(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        {
+            let mut on = self.cfg.schedule_enabled;
+            if ui
+                .checkbox(
+                    &mut on,
+                    RichText::new("switch friends on a schedule").font(theme::font_ui()),
+                )
+                .changed()
+            {
+                self.cfg.schedule_enabled = on;
+                self.reset_schedule_state();
+                self.mark_dirty();
+            }
+        }
+        if self.cfg.schedule_enabled {
+            let (day, minutes) = local_day_minutes();
+            let status = match schedule::resolve(&self.cfg.schedule, day, minutes) {
+                Some(i) => {
+                    let e = &self.cfg.schedule[i];
+                    let who = self
+                        .cfg
+                        .friends
+                        .iter()
+                        .find(|f| f.id == e.friend)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("missing friend");
+                    format!("now: {} → {} · until {}", e.label, who, e.end)
+                }
+                None => "no window active right now".into(),
+            };
+            ui.label(self.label_text(&status));
+        }
+        let friends: Vec<(String, String)> = self
+            .cfg
+            .friends
+            .iter()
+            .map(|f| {
+                let name = if f.name.is_empty() {
+                    "friend".into()
+                } else {
+                    f.name.clone()
+                };
+                (f.id.clone(), name)
+            })
+            .collect();
+        let mut remove: Option<usize> = None;
+        let mut edited = false;
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                ui.set_width(294.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for i in 0..self.cfg.schedule.len() {
+                    let mut e = self.cfg.schedule[i].clone();
+                    ui.horizontal(|ui| {
+                        ui.set_max_width(294.0);
+                        ui.checkbox(&mut e.enabled, "");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut e.label)
+                                .desired_width(100.0)
+                                .font(theme::font_ui()),
+                        );
+                        let known = friends.iter().find(|(id, _)| *id == e.friend);
+                        let sel = known.map(|(_, n)| n.as_str()).unwrap_or("missing friend");
+                        let sel_color = if known.is_some() {
+                            pal.foreground
+                        } else {
+                            pal.destructive
+                        };
+                        egui::ComboBox::from_id_salt(("sched-friend", i))
+                            .width(72.0)
+                            .selected_text(
+                                RichText::new(sel).font(theme::font_ui()).color(sel_color),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (id, name) in &friends {
+                                    ui.selectable_value(&mut e.friend, id.clone(), name);
+                                }
+                            });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if self.tiny_button(ui, "×").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.set_max_width(294.0);
+                        ui.add_space(16.0);
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (d, l) in ["m", "t", "w", "t", "f", "s", "s"].iter().enumerate() {
+                            if self.day_toggle(ui, l, e.days.contains(d as u8)).clicked() {
+                                e.days.toggle(d as u8);
+                            }
+                        }
+                        ui.add_space(6.0);
+                        time_combo(ui, ("sched-start", i), &mut e.start);
+                        ui.label(self.label_text("–"));
+                        time_combo(ui, ("sched-end", i), &mut e.end);
+                    });
+                    hline(ui, pal, 290.0);
+                    if e != self.cfg.schedule[i] {
+                        self.cfg.schedule[i] = e;
+                        edited = true;
+                    }
+                }
+            });
+        if let Some(i) = remove {
+            self.cfg.schedule.remove(i);
+            edited = true;
+        }
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("+ add window")
+                        .font(theme::font_label())
+                        .color(pal.muted_fg),
+                )
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::NONE)
+                .min_size(vec2(294.0, 26.0)),
+            )
+            .clicked()
+        {
+            self.cfg.schedule.push(schedule::ScheduleEntry {
+                label: "window".into(),
+                friend: self.cfg.active.clone(),
+                days: schedule::DaySet::workdays(),
+                start: schedule::TimeOfDay::hm(9, 0),
+                end: schedule::TimeOfDay::hm(17, 0),
+                enabled: true,
+            });
+            edited = true;
+        }
+        if edited {
+            // stored window indices may have shifted — re-resolve fresh
+            self.reset_schedule_state();
+            self.mark_dirty();
+        }
+        if schedule::any_overlap(&self.cfg.schedule) {
+            ui.label(self.label_text("overlapping windows: the shortest one wins"));
+        }
+        ui.label(self.label_text("wrapping past midnight is fine, e.g. 22:00 – 01:00"));
+    }
+
     fn tab_api(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = self.pal();
         ui.label(
@@ -1827,12 +2069,51 @@ fn adjust_weight(quotes: &mut [Quote], text: &str, dir: i32) -> bool {
     muted
 }
 
+/// One schedule evaluation step. `last` is the window resolved on the
+/// previous tick (outer None = first evaluation), `now` the one resolved
+/// this tick, `manual` the manual-override flag. Crossing a window boundary
+/// clears the override; while the override holds, nothing switches.
+/// Returns (switch to the resolved window?, override afterwards, new `last`).
+fn schedule_step(
+    last: Option<Option<usize>>,
+    now: Option<usize>,
+    manual: bool,
+) -> (bool, bool, Option<Option<usize>>) {
+    let manual = match last {
+        Some(prev) if prev != now => false, // boundary crossed
+        _ => manual,
+    };
+    (now.is_some() && !manual, manual, Some(now))
+}
+
+/// local wall clock as (days since monday, minutes since midnight)
+fn local_day_minutes() -> (u8, u16) {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    let day = now.weekday().num_days_from_monday() as u8;
+    let minutes = (now.hour() * 60 + now.minute()) as u16;
+    (day, minutes)
+}
+
 fn interval_label(secs: u64) -> String {
     INTERVALS
         .iter()
         .find(|(s, _)| *s == secs)
         .map(|(_, l)| l.to_string())
         .unwrap_or_else(|| format!("every {}s", secs))
+}
+
+/// pick a time of day in 30-minute steps
+fn time_combo(ui: &mut egui::Ui, salt: (&str, usize), t: &mut schedule::TimeOfDay) {
+    egui::ComboBox::from_id_salt(salt)
+        .width(46.0)
+        .selected_text(RichText::new(t.to_string()).font(theme::font_ui()))
+        .show_ui(ui, |ui| {
+            for step in 0..48u16 {
+                let v = schedule::TimeOfDay(step * 30);
+                ui.selectable_value(t, v, v.to_string());
+            }
+        });
 }
 
 /// which screen quadrant a point sits in — drives where bubbles/panels open
@@ -2412,6 +2693,90 @@ mod tests {
         app.import_shared(shared, Some(vec![1, 2, 3]));
         assert_eq!(app.cfg.friends.len(), n);
         assert!(app.share_note.contains("bad photo"), "{}", app.share_note);
+    }
+
+    fn window(label: &str, friend: &str, start_h: u16, end_h: u16) -> schedule::ScheduleEntry {
+        schedule::ScheduleEntry {
+            label: label.into(),
+            friend: friend.into(),
+            days: schedule::DaySet::workdays(),
+            start: schedule::TimeOfDay::hm(start_h, 0),
+            end: schedule::TimeOfDay::hm(end_h, 0),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn schedule_step_state_machine() {
+        // first evaluation: switch to the resolved window, override untouched
+        assert_eq!(
+            schedule_step(None, Some(0), false),
+            (true, false, Some(Some(0)))
+        );
+        assert_eq!(schedule_step(None, None, false), (false, false, Some(None)));
+        // steady state inside a window: no boundary, override holds
+        assert_eq!(
+            schedule_step(Some(Some(0)), Some(0), true),
+            (false, true, Some(Some(0)))
+        );
+        // boundary (window change) clears the override and switches
+        assert_eq!(
+            schedule_step(Some(Some(0)), Some(1), true),
+            (true, false, Some(Some(1)))
+        );
+        // boundary out of all windows clears the override too, but nothing
+        // gets switched to
+        assert_eq!(
+            schedule_step(Some(Some(1)), None, true),
+            (false, false, Some(None))
+        );
+    }
+
+    #[test]
+    fn schedule_switches_and_respects_manual_override() {
+        let mut app = app();
+        app.cfg.schedule_enabled = true;
+        app.cfg.schedule = vec![
+            window("work", "marc", 9, 17),
+            window("sport", "coach", 12, 13),
+        ];
+        app.cfg.active = "ana".into();
+        app.apply_schedule(0, 10 * 60); // mon 10:00 → work window
+        assert_eq!(app.cfg.active, "marc");
+        assert!(app.bubble.is_some(), "the scheduled friend greets");
+        app.apply_schedule(0, 12 * 60 + 30); // lunch → the shorter sport window
+        assert_eq!(app.cfg.active, "coach");
+        app.pick_friend("ana"); // manual pick mid-window …
+        assert!(app.manual_override);
+        app.apply_schedule(0, 12 * 60 + 45); // … holds within the same window
+        assert_eq!(app.cfg.active, "ana");
+        app.apply_schedule(0, 13 * 60 + 5); // boundary: sport ended → work reasserts
+        assert_eq!(app.cfg.active, "marc");
+        assert!(!app.manual_override);
+    }
+
+    #[test]
+    fn schedule_ignores_missing_friends_and_no_windows() {
+        let mut app = app();
+        app.cfg.schedule_enabled = true;
+        app.cfg.schedule = vec![window("gym", "nobody", 0, 23)];
+        let before = app.cfg.active.clone();
+        app.apply_schedule(2, 5 * 60);
+        assert_eq!(app.cfg.active, before, "unknown friend id never fires");
+        app.cfg.schedule.clear();
+        app.apply_schedule(2, 5 * 60);
+        assert_eq!(app.cfg.active, before, "no windows → nothing happens");
+    }
+
+    #[test]
+    fn disabling_the_schedule_clears_its_state() {
+        let mut app = app();
+        app.manual_override = true;
+        app.last_sched_target = Some(Some(0));
+        app.cfg.schedule_enabled = false;
+        app.tick_timers();
+        assert!(!app.manual_override);
+        assert!(app.last_sched_target.is_none());
     }
 
     #[test]

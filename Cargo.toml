@@ -18,6 +18,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 ureq = { version = "3", features = ["json"] }
 rfd = "0.17"
 arboard = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fastrand = "2"
 rustface = "0.1.7"
 

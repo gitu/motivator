@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::schedule::{DaySet, ScheduleEntry, TimeOfDay};
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Corner {
@@ -178,6 +180,15 @@ pub struct Config {
     pub api: ApiConfig,
     pub friends: Vec<Friend>,
     pub active: String,
+    /// master switch for the schedule below; off = the active friend only
+    /// changes when picked by hand
+    #[serde(default)]
+    pub schedule_enabled: bool,
+    /// time windows in which a specific friend takes over the motivating,
+    /// e.g. work 09:00–17:00 on workdays, sport over lunch, wind-down in the
+    /// evening. Overlaps are fine — the shortest window wins.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleEntry>,
 }
 
 impl Default for Config {
@@ -192,8 +203,41 @@ impl Default for Config {
             api: ApiConfig::default(),
             friends: default_friends(),
             active: "marc".into(),
+            schedule_enabled: false,
+            schedule: default_schedule(),
         }
     }
+}
+
+/// Example windows wired to the default friends — visible in the schedule
+/// tab as a template, but inert until `schedule_enabled` is switched on.
+fn default_schedule() -> Vec<ScheduleEntry> {
+    vec![
+        ScheduleEntry {
+            label: "work".into(),
+            friend: "marc".into(),
+            days: DaySet::workdays(),
+            start: TimeOfDay::hm(9, 0),
+            end: TimeOfDay::hm(17, 0),
+            enabled: true,
+        },
+        ScheduleEntry {
+            label: "sport".into(),
+            friend: "coach".into(),
+            days: DaySet::workdays(),
+            start: TimeOfDay::hm(12, 0),
+            end: TimeOfDay::hm(13, 0),
+            enabled: true,
+        },
+        ScheduleEntry {
+            label: "wind down — pc away".into(),
+            friend: "ana".into(),
+            days: DaySet::every_day(),
+            start: TimeOfDay::hm(18, 0),
+            end: TimeOfDay::hm(22, 0),
+            enabled: true,
+        },
+    ]
 }
 
 fn default_friends() -> Vec<Friend> {
@@ -280,6 +324,11 @@ impl Config {
             .unwrap_or_default();
         if cfg.friends.is_empty() {
             cfg.friends = default_friends();
+            // only a fresh/wiped config gets the example windows — never
+            // overwrite a schedule someone has already shaped
+            if cfg.schedule.is_empty() {
+                cfg.schedule = default_schedule();
+            }
         }
         if !cfg.friends.iter().any(|f| f.id == cfg.active) {
             cfg.active = cfg.friends[0].id.clone();
@@ -335,6 +384,34 @@ mod tests {
         assert_eq!(back.pos, Some((120.5, 640.0)));
         assert_eq!(back.friends[0].quotes.len(), 4);
         assert!(matches!(back.friends[0].expansion, Expansion::Remix));
+        assert_eq!(back.schedule.len(), 3);
+        assert_eq!(back.schedule, cfg.schedule);
+        assert!(!back.schedule_enabled, "schedule ships switched off");
+    }
+
+    #[test]
+    fn default_schedule_resolves_examples() {
+        // monday: work at 10:00, sport over lunch, wind-down in the evening
+        let cfg = Config::default();
+        let friend_at = |minutes| {
+            crate::schedule::resolve(&cfg.schedule, 0, minutes)
+                .map(|i| cfg.schedule[i].friend.as_str())
+        };
+        assert_eq!(friend_at(10 * 60), Some("marc"));
+        assert_eq!(friend_at(12 * 60 + 30), Some("coach"));
+        assert_eq!(friend_at(19 * 60), Some("ana"));
+        assert_eq!(friend_at(23 * 60), None);
+        // every friend the examples point at actually exists
+        for e in &cfg.schedule {
+            assert!(cfg.friends.iter().any(|f| f.id == e.friend), "{}", e.friend);
+        }
+    }
+
+    #[test]
+    fn schedule_lives_on_config_not_on_friends() {
+        // friend cards serialize a Friend — the schedule must never ride along
+        let json = serde_json::to_string(&Config::default().friends[0]).unwrap();
+        assert!(!json.contains("schedule"));
     }
 
     #[test]
@@ -366,5 +443,9 @@ mod tests {
         assert_eq!(cfg.pos, None);
         assert_eq!(cfg.friends[0].split, 0.52);
         assert!(cfg.friends[0].pool.is_empty());
+        // schedule arrived later still: existing configs keep an empty
+        // schedule (no surprise example windows), and it stays off
+        assert!(cfg.schedule.is_empty());
+        assert!(!cfg.schedule_enabled);
     }
 }
