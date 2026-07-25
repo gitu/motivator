@@ -41,10 +41,10 @@ pub fn process_and_store(src: &Path, friend_id: &str) -> Result<Processed, Strin
     Ok(Processed { path, split })
 }
 
-/// Detect the (largest) face and place the mouth line at 74% of the face
-/// box height — the lip line's position within SeetaFace's detection box,
-/// calibrated on sample portraits. (The original design used 82% of the
-/// browser FaceDetector's box, which frames faces differently.)
+/// Detect the (largest) face and hinge the flap in the middle of the mouth:
+/// a coarse anchor from the face box leads to the lip-parting shadow, and
+/// the split lands mid-teeth (when visible) or just inside the mouth, so the
+/// upper teeth lift with the head while the jaw stays.
 /// Returns None when no face is found.
 fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
     let model = rustface::model::read_model(std::io::Cursor::new(FACE_MODEL)).ok()?;
@@ -67,7 +67,10 @@ fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
     // the darkest row shadow between the lips
     let anchor = bbox.y() as f32 + bbox.height() as f32 * 0.765;
     let parting = darkest_row_near(img, b, anchor);
-    let refined = snap_above_teeth(img, b, parting);
+    // hinge in the MIDDLE of the mouth so upper teeth lift with the head and
+    // the lower lip stays — like a real jaw. Teeth band center when teeth are
+    // detectable, otherwise the parting shadow nudged into the mouth.
+    let refined = center_on_teeth(img, b, parting).unwrap_or(parting + 0.02 * bbox.height() as f32);
     if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
         eprintln!(
             "face bbox: x={} y={} w={} h={} (image {}x{}) anchor={anchor:.1} parting={parting:.1} refined={refined:.1}",
@@ -110,12 +113,13 @@ fn darkest_row_near(img: &RgbaImage, bbox: (i32, i32, u32, u32), anchor: f32) ->
     best.0
 }
 
-/// If teeth are visible (a smile), a split through them puts teeth on both
-/// flap slices — creepy in motion. Look for the teeth band (bright, low
-/// chroma rows in the central strip of the face) around the candidate mouth
-/// line and snap the split to just above it, so the whole set of teeth stays
-/// on the static bottom slice and the lifting top reads as the upper lip.
-fn snap_above_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) -> f32 {
+/// Locate the visible teeth band (bright, low-chroma rows in the central
+/// strip of the face) around the candidate mouth line and return its center
+/// — splitting mid-teeth sends the upper set with the lifting head and keeps
+/// the lower set with the jaw, like a mouth actually opening.
+/// Returns None when no plausible band exists (closed mouth, warm-lit teeth
+/// that match skin tones, pale-skin false positives).
+fn center_on_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) -> Option<f32> {
     let (bx, _by, bw, bh) = bbox;
     let win = 0.12 * bh as f32;
     let y_lo = (mouth_y - win).max(0.0) as u32;
@@ -124,7 +128,7 @@ fn snap_above_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) -
     let x_lo = (bx + bw as i32 / 4).clamp(0, img.width() as i32 - 1) as u32;
     let x_hi = (bx + (bw as i32 * 3) / 4).clamp(0, img.width() as i32 - 1) as u32;
     if y_lo >= y_hi || x_lo >= x_hi {
-        return mouth_y;
+        return None;
     }
     let toothy: Vec<bool> = (y_lo..=y_hi)
         .map(|y| {
@@ -160,20 +164,16 @@ fn snap_above_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) -
         }
     }
     if best_len < 2.max((0.015 * bh as f32) as usize) {
-        return mouth_y; // no teeth visible (closed mouth) — keep the estimate
+        return None; // no teeth visible (closed mouth)
     }
     if best_len as f32 > 0.08 * bh as f32 {
-        return mouth_y; // far too tall for teeth — pale skin, not a mouth
+        return None; // far too tall for teeth — pale skin, not a mouth
     }
     let band_top = y_lo as f32 + best_start as f32;
     if band_top < mouth_y - 0.06 * bh as f32 || band_top > mouth_y + 0.12 * bh as f32 {
-        return mouth_y; // stray highlight away from the mouth line
+        return None; // stray highlight away from the mouth line
     }
-    if mouth_y < band_top {
-        return mouth_y; // already above the teeth — the parting line stands
-    }
-    // hinge right at the teeth top: that IS the parting on an open smile
-    (band_top - 0.005 * bh as f32).max(0.0)
+    Some(band_top + best_len as f32 / 2.0)
 }
 
 /// Remove the background by flood-filling from the top/left/right borders,
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn split_snaps_above_visible_teeth() {
+    fn split_centers_on_visible_teeth() {
         // warm "skin" face with a bright neutral teeth band at y=44..48
         let mut img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
         for y in 44..48 {
@@ -425,13 +425,12 @@ mod tests {
             }
         }
         let bbox = (10, 0, 80u32, 90u32);
-        // candidate line mid-teeth (y=46) must snap above the band
-        let snapped = snap_above_teeth(&img, bbox, 46.0);
+        // the hinge goes mid-band: upper teeth lift, lower part stays
+        let center = center_on_teeth(&img, bbox, 43.0).expect("band found");
         assert!(
-            snapped < 44.0,
-            "split {snapped} should sit above the teeth band at y=44"
+            (45.0..=47.0).contains(&center),
+            "split {center} should sit mid-teeth (band 44..48)"
         );
-        assert!(snapped > 38.0, "split {snapped} should stay near the mouth");
     }
 
     #[test]
@@ -452,10 +451,10 @@ mod tests {
     }
 
     #[test]
-    fn split_unchanged_without_teeth() {
+    fn no_teeth_band_on_closed_mouth() {
         // closed mouth: uniform warm skin, no bright neutral band
         let img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
-        assert_eq!(snap_above_teeth(&img, (10, 0, 80, 90), 46.0), 46.0);
+        assert!(center_on_teeth(&img, (10, 0, 80, 90), 46.0).is_none());
     }
 
     #[test]
