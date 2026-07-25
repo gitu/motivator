@@ -697,6 +697,75 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode_resizes_oversize_images_to_a_png() {
+        // a 2400px-wide upload can't become a texture verbatim — raw mode
+        // falls back to one resized PNG instead of a byte copy
+        let dir = tmp_dir("raw-oversize");
+        let img = RgbaImage::from_pixel(2400, 200, image::Rgba([200, 150, 120, 255]));
+        let p = process_bytes(&png_bytes(&img), Some("jpg"), &dir, "x", PhotoMode::Raw).unwrap();
+        assert!(p.path.ends_with("x.png"), "fallback is a png, not x.jpg");
+        let out = image::open(&p.path).unwrap();
+        assert!(out.width() <= RAW_EDGE && out.height() <= RAW_EDGE);
+        assert_eq!(p.split, None);
+    }
+
+    fn gif_bytes(frames: &[(RgbaImage, u32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut bytes);
+        enc.set_repeat(image::codecs::gif::Repeat::Infinite)
+            .unwrap();
+        for (img, ms) in frames {
+            enc.encode_frame(image::Frame::from_parts(
+                img.clone(),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(*ms, 1),
+            ))
+            .unwrap();
+        }
+        drop(enc);
+        bytes
+    }
+
+    #[test]
+    fn zero_and_extreme_frame_delays_are_normalized() {
+        // 0 ms (unset in many GIFs) → 100 ms default; 5 s clamps to 1 s
+        let img = RgbaImage::from_pixel(16, 16, image::Rgba([60, 40, 40, 255]));
+        let bytes = gif_bytes(&[(img.clone(), 0), (img, 5000)]);
+        let frames = decode_frames(&bytes);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].1, 100);
+        assert_eq!(frames[1].1, 1000);
+    }
+
+    #[test]
+    fn animated_auto_mode_cuts_the_background_in_every_frame() {
+        // flat light background, dark subject sliding right by a few px per
+        // frame — auto mode must remove the background in each frame using
+        // the reference colors sampled from frame 0
+        let mut frames = Vec::new();
+        for n in 0..3u32 {
+            let mut img = RgbaImage::from_pixel(64, 64, image::Rgba([240, 240, 240, 255]));
+            for y in 16..56 {
+                for x in (20 + n)..(40 + n) {
+                    img.put_pixel(x, y, image::Rgba([60, 40, 40, 255]));
+                }
+            }
+            frames.push((img, 80));
+        }
+        let dir = tmp_dir("anim-auto");
+        let p =
+            process_bytes(&gif_bytes(&frames), Some("gif"), &dir, "x", PhotoMode::Auto).unwrap();
+        assert_eq!(p.frames.len(), 3);
+        for (n, (path, _)) in p.frames.iter().enumerate() {
+            let out = image::open(path).unwrap().to_rgba8();
+            assert_eq!(out.get_pixel(1, 1)[3], 0, "frame {n}: corner transparent");
+            let c = out.get_pixel(out.width() / 2, out.height() / 2)[3];
+            assert!(c > 0, "frame {n}: subject stays opaque");
+        }
+    }
+
+    #[test]
     fn reupload_removes_stale_frames_but_not_the_talk_still() {
         let dir = tmp_dir("stale");
         for name in ["x.f0.png", "x.f1.png", "x.gif", "x.talk.png", "xy.png"] {

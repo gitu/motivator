@@ -57,6 +57,30 @@ actually say — with a little talking animation. Teach it which lines land with
 - **start on login** — optional autostart toggle in config → behavior (XDG
   autostart on Linux, login item on macOS, registry Run key on Windows)
 
+## animation styles
+
+Every friend picks a talking style and an idle animation in config → friend
+(right-click the avatar → config). Talking plays on every poke, nudge, and
+chat reply:
+
+| flap | bounce | sway | swap |
+|:---:|:---:|:---:|:---:|
+| ![jaw-flap talking](assets/anim-flap.gif) | ![bounce talking](assets/anim-bounce.gif) | ![sway talking](assets/anim-sway.gif) | ![two-frame swap](assets/anim-swap.gif) |
+
+*flap* hinges the head at the face-detected mouth line (correct it with the
+*mouth line* slider if the detector guessed wrong); *swap* alternates with a
+second uploaded still — ideally the same photo with the mouth open.
+
+Idle animations run continuously, so the avatar never sits frozen:
+
+| breathe | sway | alive |
+|:---:|:---:|:---:|
+| ![breathe idle](assets/anim-breathe.gif) | ![sway idle](assets/anim-idle-sway.gif) | ![alive idle](assets/anim-alive.gif) |
+
+*alive* combines breathing and swaying with an occasional micro-bob. And for
+avatars that bring their own motion: upload an animated GIF / APNG / WebP and
+it plays as-is — background removal and all (up to 48 frames).
+
 ## install
 
 macOS, via [Homebrew](https://brew.sh):
