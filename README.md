@@ -46,6 +46,11 @@ macOS, via [Homebrew](https://brew.sh):
 brew install --cask gitu/tap/motivator
 ```
 
+The cask puts `motivator` on your PATH and clears the quarantine flag during
+install (builds are unsigned) — start it from a terminal with `motivator`.
+If Gatekeeper still complains, clear the flag yourself:
+`xattr -d com.apple.quarantine "$(which motivator)"`.
+
 macOS / Linux, via install script (installs to `~/.local/bin`):
 
 ```sh
