@@ -109,8 +109,8 @@ native-Wayland — then use your compositor's window rules to pin the widget
 - **↑ more / ↓ less** — teach it which lines land; a line weighted to 0 is
   muted and struck through in config → quotes
 - **→ next** — another line
-- **chat · friends · config** — chips next to the avatar
-- **right-click the avatar** — quit
+- **right-click the avatar** — chat, friends roster, config, quit; nothing
+  but the face is shown until you ask for it
 
 ## license
 
