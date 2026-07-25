@@ -7,16 +7,26 @@ mod photo;
 mod theme;
 
 fn main() -> eframe::Result {
-    // `motivator --cutout <image> <friend-id>` runs the photo pipeline and
-    // exits — useful for scripting/debugging avatar cut-outs
+    // `motivator --cutout <image> <friend-id> [auto|precut|raw]` runs the
+    // photo pipeline and exits — useful for scripting/debugging avatar
+    // cut-outs
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|a| a == "--cutout") {
-        let (src, id) = (
-            args.get(2).expect("usage: --cutout <image> <friend-id>"),
-            args.get(3).expect("usage: --cutout <image> <friend-id>"),
-        );
-        match photo::process_and_store(std::path::Path::new(src), id) {
-            Ok(p) => println!("ok {} split={:.3}", p.path.display(), p.split),
+        let usage = "usage: --cutout <image> <friend-id> [auto|precut|raw]";
+        let (src, id) = (args.get(2).expect(usage), args.get(3).expect(usage));
+        let mode = match args.get(4).map(String::as_str) {
+            None | Some("auto") => config::PhotoMode::Auto,
+            Some("precut") => config::PhotoMode::Precut,
+            Some("raw") => config::PhotoMode::Raw,
+            Some(_) => panic!("{usage}"),
+        };
+        match photo::process_and_store(std::path::Path::new(src), id, mode) {
+            Ok(p) => println!(
+                "ok {} split={} frames={}",
+                p.path.display(),
+                p.split.map_or("none".into(), |s| format!("{s:.3}")),
+                p.frames.len()
+            ),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);

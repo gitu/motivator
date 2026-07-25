@@ -35,6 +35,15 @@ actually say — with a little talking animation. Teach it which lines land with
   (flood fill from the borders) and the mouth is located by real face
   detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
   fallback) so the head's top half can flap while talking, jaw-snap style
+- **photo control** — pick per friend how uploads are processed: *auto
+  cut-out*, *already cut out* (keeps your PNG's transparency, skips the flood
+  fill), or *keep as-is* (stored untouched, no resize, no detection); a mouth
+  line slider corrects the detected flap hinge when needed
+- **animation styles** — per friend: a talking style (jaw-flap, bounce, sway,
+  two-frame swap with an uploaded mouth-open still, or none) plus a continuous
+  idle animation (breathe, sway, or *alive*) so the avatar never sits frozen
+- **animated avatars** — upload an animated GIF / APNG / animated WebP and it
+  plays as the avatar, background cut-out and all (up to 48 frames)
 - **sizes** — avatar size 56–96 px, bubble duration, corner, dark/light theme,
   all in config → behavior
 

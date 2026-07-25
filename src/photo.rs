@@ -1,44 +1,227 @@
 //! Photo pipeline: background cut-out (border flood fill against corner
 //! reference colors) and mouth-line estimation for the talking flap.
-//! Direct port of the design's canvas pipeline.
+//! Direct port of the design's canvas pipeline, extended with explicit
+//! processing modes (auto / pre-cut / raw) and animated-avatar decoding.
 
 use std::path::{Path, PathBuf};
 
-use image::RgbaImage;
+use image::{AnimationDecoder, RgbaImage};
+
+use crate::config::PhotoMode;
 
 /// SeetaFace frontal detection model (BSD-2, VIPL group / rustface project)
 static FACE_MODEL: &[u8] = include_bytes!("../assets/seeta_fd_frontal_v1.0.bin");
 
+/// animated avatars are bounded so 48 × 256² RGBA stays ~12 MB worst case
+const MAX_FRAMES: usize = 48;
+const ANIM_EDGE: u32 = 256;
+/// cap size for stills: plenty for a <=96px avatar, keeps flood fill cheap
+const STILL_EDGE: u32 = 512;
+/// raw files above this become one resized PNG — a texture has to fit in VRAM
+const RAW_EDGE: u32 = 2048;
+
 pub struct Processed {
     pub path: PathBuf,
-    pub split: f32,
+    /// detected mouth line; None when detection was skipped (raw mode)
+    pub split: Option<f32>,
+    /// animated frames (path, delay ms); empty for a still
+    pub frames: Vec<(PathBuf, u32)>,
 }
 
-pub fn process_and_store(src: &Path, friend_id: &str) -> Result<Processed, String> {
-    let img = image::open(src).map_err(|e| format!("could not read image: {e}"))?;
-    // cap size: plenty for a <=96px avatar, keeps flood fill + textures cheap
-    let img = img.resize(512, 512, image::imageops::FilterType::Triangle);
+/// `stem` names the files on disk: `{stem}.png` for a still,
+/// `{stem}.f{n}.png` for animation frames (the app passes the friend id, or
+/// `{id}.talk` for the talking still).
+pub fn process_and_store(src: &Path, stem: &str, mode: PhotoMode) -> Result<Processed, String> {
+    let bytes = std::fs::read(src).map_err(|e| format!("could not read image: {e}"))?;
+    let ext = src.extension().and_then(|e| e.to_str());
+    let dir = crate::config::photos_dir();
+    process_bytes(&bytes, ext, &dir, stem, mode)
+}
+
+fn process_bytes(
+    bytes: &[u8],
+    src_ext: Option<&str>,
+    dir: &Path,
+    stem: &str,
+    mode: PhotoMode,
+) -> Result<Processed, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    remove_stale(dir, stem);
+
+    let frames = decode_frames(bytes);
+    if frames.len() > 1 {
+        return store_animation(frames, dir, stem, mode);
+    }
+    if mode == PhotoMode::Raw {
+        return store_raw(bytes, src_ext, dir, stem);
+    }
+
+    let img = image::load_from_memory(bytes).map_err(|e| format!("could not read image: {e}"))?;
+    let img = img.resize(
+        STILL_EDGE,
+        STILL_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
     let mut rgba = img.to_rgba8();
 
     // find the mouth on the pristine photo before the cut-out touches it;
     // the silhouette heuristic is only the no-face-found fallback
     let face_split = mouth_from_face(&rgba);
 
-    // pre-cut PNGs (real transparency) skip the flood fill — the alpha channel
-    // already is the cut-out
+    // pre-cut images (real transparency) skip the flood fill — the alpha
+    // channel already is the cut-out; "already cut out" mode forces that
     let transparent = rgba.pixels().filter(|p| p[3] < 128).count();
-    let heuristic_split = if transparent > (rgba.width() * rgba.height()) as usize / 50 {
+    let heuristic_split = if mode == PhotoMode::Precut
+        || transparent > (rgba.width() * rgba.height()) as usize / 50
+    {
         split_heuristic(&rgba)
     } else {
         cutout(&mut rgba).or_else(|| split_heuristic(&rgba))
     };
     let split = face_split.or(heuristic_split).unwrap_or(0.52);
 
-    let dir = crate::config::photos_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{friend_id}.png"));
+    let path = dir.join(format!("{stem}.png"));
     rgba.save(&path).map_err(|e| e.to_string())?;
-    Ok(Processed { path, split })
+    Ok(Processed {
+        path,
+        split: Some(split),
+        frames: Vec::new(),
+    })
+}
+
+/// Raw mode: the file lands on disk byte-identical (any format the renderer
+/// can open), unless it is too large to be a texture — then it becomes one
+/// resized PNG, pixels otherwise untouched.
+fn store_raw(
+    bytes: &[u8],
+    src_ext: Option<&str>,
+    dir: &Path,
+    stem: &str,
+) -> Result<Processed, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("could not read image: {e}"))?;
+    let path = if img.width() <= RAW_EDGE && img.height() <= RAW_EDGE {
+        let ext = src_ext
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_else(|| "png".into());
+        let path = dir.join(format!("{stem}.{ext}"));
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        path
+    } else {
+        let img = img.resize(RAW_EDGE, RAW_EDGE, image::imageops::FilterType::Triangle);
+        let path = dir.join(format!("{stem}.png"));
+        img.to_rgba8().save(&path).map_err(|e| e.to_string())?;
+        path
+    };
+    Ok(Processed {
+        path,
+        split: None,
+        frames: Vec::new(),
+    })
+}
+
+/// Decode an animated GIF / APNG / WebP into composited RGBA frames with
+/// per-frame delays. Returns an empty vec for stills and unknown formats.
+fn decode_frames(bytes: &[u8]) -> Vec<(RgbaImage, u32)> {
+    fn collect(frames: image::Frames) -> Vec<(RgbaImage, u32)> {
+        frames
+            .take(MAX_FRAMES)
+            .filter_map(|f| f.ok())
+            .map(|f| {
+                let (num, den) = f.delay().numer_denom_ms();
+                let ms = num / den.max(1);
+                let ms = if ms == 0 { 100 } else { ms.clamp(20, 1000) };
+                (f.into_buffer(), ms)
+            })
+            .collect()
+    }
+    if bytes.starts_with(b"GIF8") {
+        if let Ok(d) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)) {
+            return collect(d.into_frames());
+        }
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        if let Ok(d) = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)) {
+            if d.is_apng().unwrap_or(false) {
+                if let Ok(a) = d.apng() {
+                    return collect(a.into_frames());
+                }
+            }
+        }
+    }
+    if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        if let Ok(d) = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes)) {
+            if d.has_animation() {
+                return collect(d.into_frames());
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Store animation frames as `{stem}.f{n}.png`. The cut-out (auto mode)
+/// samples its background reference colors once, from frame 0, so the cut
+/// stays stable across frames; implausible frames are left un-cut rather
+/// than flickering. Face detection runs on frame 0 only.
+fn store_animation(
+    frames: Vec<(RgbaImage, u32)>,
+    dir: &Path,
+    stem: &str,
+    mode: PhotoMode,
+) -> Result<Processed, String> {
+    let mut out = Vec::new();
+    let mut refs: Option<Vec<[i32; 3]>> = None;
+    let mut split = None;
+    for (n, (frame, ms)) in frames.into_iter().enumerate() {
+        let img = image::DynamicImage::ImageRgba8(frame).resize(
+            ANIM_EDGE,
+            ANIM_EDGE,
+            image::imageops::FilterType::Triangle,
+        );
+        let mut rgba = img.to_rgba8();
+        if n == 0 && mode != PhotoMode::Raw {
+            split = mouth_from_face(&rgba).or_else(|| split_heuristic(&rgba));
+        }
+        if mode == PhotoMode::Auto {
+            let transparent = rgba.pixels().filter(|p| p[3] < 128).count();
+            if transparent <= (rgba.width() * rgba.height()) as usize / 50 {
+                let r = refs.get_or_insert_with(|| sample_refs(&rgba)).clone();
+                cutout_with_refs(&mut rgba, &r);
+            }
+        }
+        let path = dir.join(format!("{stem}.f{n}.png"));
+        rgba.save(&path).map_err(|e| e.to_string())?;
+        out.push((path, ms));
+    }
+    Ok(Processed {
+        path: out[0].0.clone(),
+        split,
+        frames: out,
+    })
+}
+
+/// Delete this stem's previous photo files (`{stem}.png` / `{stem}.gif` / …
+/// and frames `{stem}.f{n}.png`) so re-uploads never leave orphans. Files of
+/// a longer stem like `{stem}.talk.png` have an extra dot and are kept.
+fn remove_stale(dir: &Path, stem: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(&format!("{stem}.")))
+        else {
+            continue;
+        };
+        let is_frame = rest
+            .strip_prefix('f')
+            .and_then(|r| r.strip_suffix(".png"))
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+        if is_frame || !rest.contains('.') {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Detect the (largest) face and hinge the flap in the middle of the mouth:
@@ -181,18 +364,37 @@ fn center_on_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) ->
 /// Returns the mouth split if the cut-out looks plausible, None if the image
 /// was left untouched (removal ratio implausible).
 fn cutout(img: &mut RgbaImage) -> Option<f32> {
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    if w < 8 || h < 8 {
+    let refs = sample_refs(img);
+    if !cutout_with_refs(img, &refs) {
         return None;
     }
-    let px = img.as_mut();
-    let refs: Vec<[i32; 3]> = [(1, 1), (w - 2, 1), (1, h / 2), (w - 2, h / 2)]
+    split_heuristic(img).or(Some(0.52))
+}
+
+/// Background reference colors sampled near the corners/edges.
+fn sample_refs(img: &RgbaImage) -> Vec<[i32; 3]> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < 8 || h < 8 {
+        return Vec::new();
+    }
+    let px = img.as_raw();
+    [(1, 1), (w - 2, 1), (1, h / 2), (w - 2, h / 2)]
         .iter()
         .map(|&(x, y)| {
             let i = (y * w + x) * 4;
             [px[i] as i32, px[i + 1] as i32, px[i + 2] as i32]
         })
-        .collect();
+        .collect()
+}
+
+/// Flood fill from the borders against `refs`; returns false when the
+/// removal ratio was implausible (image left untouched).
+fn cutout_with_refs(img: &mut RgbaImage, refs: &[[i32; 3]]) -> bool {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < 8 || h < 8 || refs.is_empty() {
+        return false;
+    }
+    let px = img.as_mut();
     let tol = 48 * 48;
     let is_bg = |px: &[u8], p: usize| {
         let i = p * 4;
@@ -231,7 +433,7 @@ fn cutout(img: &mut RgbaImage) -> Option<f32> {
 
     let n = removed.iter().filter(|&&r| r).count();
     if n < w * h / 20 || n > w * h * 9 / 10 {
-        return None; // not a clean background — keep the photo as-is
+        return false; // not a clean background — keep the photo as-is
     }
     for p in 0..w * h {
         if removed[p] {
@@ -255,7 +457,7 @@ fn cutout(img: &mut RgbaImage) -> Option<f32> {
             px[p * 4 + 3] = px[p * 4 + 3].min(110);
         }
     }
-    split_heuristic(img).or(Some(0.52))
+    true
 }
 
 /// Zero the alpha of every 4-connected opaque region except the largest one.
@@ -407,12 +609,105 @@ mod tests {
         img.save(&src).unwrap();
 
         std::env::set_var("XDG_DATA_HOME", dir.join("data"));
-        let p = process_and_store(&src, "precut-test").unwrap();
+        let p = process_and_store(&src, "precut-test", PhotoMode::Auto).unwrap();
         let out = image::open(&p.path).unwrap().to_rgba8();
         // alpha preserved: corners stay transparent, center stays opaque
         assert_eq!(out.get_pixel(1, 1)[3], 0);
         assert!(out.get_pixel(out.width() / 2, out.height() / 2)[3] > 0);
-        assert!((0.3..=0.78).contains(&p.split), "split={}", p.split);
+        let split = p.split.expect("still photos report a split");
+        assert!((0.3..=0.78).contains(&split), "split={split}");
+        assert!(p.frames.is_empty());
+    }
+
+    fn png_bytes(img: &RgbaImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img.clone())
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("motivator-photo-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn precut_mode_never_touches_an_opaque_background() {
+        // a portrait on a clean flat background: auto would flood-fill it away,
+        // "already cut out" must leave every pixel opaque
+        let dir = tmp_dir("precut-mode");
+        let p = process_bytes(
+            &png_bytes(&portrait()),
+            Some("png"),
+            &dir,
+            "x",
+            PhotoMode::Precut,
+        )
+        .unwrap();
+        let out = image::open(&p.path).unwrap().to_rgba8();
+        assert!(out.pixels().all(|px| px[3] == 255), "no pixel may be cut");
+        assert!(p.split.is_some(), "precut still detects the mouth");
+    }
+
+    #[test]
+    fn raw_mode_stores_the_file_byte_identical() {
+        let dir = tmp_dir("raw-mode");
+        let bytes = png_bytes(&portrait());
+        let p = process_bytes(&bytes, Some("png"), &dir, "x", PhotoMode::Raw).unwrap();
+        assert_eq!(std::fs::read(&p.path).unwrap(), bytes);
+        assert_eq!(p.split, None, "raw mode skips detection");
+        assert!(p.frames.is_empty());
+    }
+
+    #[test]
+    fn animated_gif_becomes_frames_with_delays() {
+        let mut bytes = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(&mut bytes);
+            enc.set_repeat(image::codecs::gif::Repeat::Infinite)
+                .unwrap();
+            for shade in [60u8, 140, 220] {
+                let img = RgbaImage::from_pixel(32, 32, image::Rgba([shade, 40, 40, 255]));
+                enc.encode_frame(image::Frame::from_parts(
+                    img,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(120, 1),
+                ))
+                .unwrap();
+            }
+        }
+        let dir = tmp_dir("animated");
+        let p = process_bytes(&bytes, Some("gif"), &dir, "x", PhotoMode::Precut).unwrap();
+        assert_eq!(p.frames.len(), 3);
+        assert_eq!(p.path, p.frames[0].0, "photo points at frame 0");
+        for (n, (path, ms)) in p.frames.iter().enumerate() {
+            assert!(path.ends_with(format!("x.f{n}.png")), "frame file {n}");
+            assert!(path.exists());
+            assert_eq!(*ms, 120);
+        }
+    }
+
+    #[test]
+    fn reupload_removes_stale_frames_but_not_the_talk_still() {
+        let dir = tmp_dir("stale");
+        for name in ["x.f0.png", "x.f1.png", "x.gif", "x.talk.png", "xy.png"] {
+            std::fs::write(dir.join(name), b"z").unwrap();
+        }
+        remove_stale(&dir, "x");
+        assert!(!dir.join("x.f0.png").exists());
+        assert!(!dir.join("x.f1.png").exists());
+        assert!(!dir.join("x.gif").exists());
+        assert!(dir.join("x.talk.png").exists(), "other stem must survive");
+        assert!(dir.join("xy.png").exists(), "other friend must survive");
     }
 
     #[test]

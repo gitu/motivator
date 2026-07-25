@@ -63,6 +63,93 @@ impl Accent {
     ];
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PhotoMode {
+    /// flood-fill cut-out + face detection (the original pipeline)
+    #[default]
+    Auto,
+    /// trust the image's own alpha channel; still resize + detect the mouth
+    Precut,
+    /// store the file untouched: no resize, no cut-out, no detection
+    Raw,
+}
+
+impl PhotoMode {
+    pub const ALL: [PhotoMode; 3] = [PhotoMode::Auto, PhotoMode::Precut, PhotoMode::Raw];
+    pub fn label(self) -> &'static str {
+        match self {
+            PhotoMode::Auto => "auto cut-out",
+            PhotoMode::Precut => "already cut out",
+            PhotoMode::Raw => "keep as-is",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TalkAnim {
+    /// jaw-snap: the head above the mouth line lifts (needs a mouth split)
+    #[default]
+    Flap,
+    /// the whole avatar bounces on syllable cadence
+    Bounce,
+    /// quick left/right shimmy
+    Sway,
+    /// alternate with the "talking" still (photo_talk)
+    Swap,
+    None,
+}
+
+impl TalkAnim {
+    pub const ALL: [TalkAnim; 5] = [
+        TalkAnim::Flap,
+        TalkAnim::Bounce,
+        TalkAnim::Sway,
+        TalkAnim::Swap,
+        TalkAnim::None,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            TalkAnim::Flap => "flap",
+            TalkAnim::Bounce => "bounce",
+            TalkAnim::Sway => "sway",
+            TalkAnim::Swap => "swap",
+            TalkAnim::None => "none",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleAnim {
+    #[default]
+    Off,
+    /// slow vertical squash-and-stretch
+    Breathe,
+    /// gentle continuous lateral drift
+    Sway,
+    /// breathe + sway + an occasional micro-bob
+    Alive,
+}
+
+impl IdleAnim {
+    pub const ALL: [IdleAnim; 4] = [
+        IdleAnim::Off,
+        IdleAnim::Breathe,
+        IdleAnim::Sway,
+        IdleAnim::Alive,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            IdleAnim::Off => "off",
+            IdleAnim::Breathe => "breathe",
+            IdleAnim::Sway => "sway",
+            IdleAnim::Alive => "alive",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuoteSrc {
@@ -123,6 +210,23 @@ pub struct Friend {
     /// mouth line as a fraction of image height — the talking flap splits here
     #[serde(default = "default_split")]
     pub split: f32,
+    /// the user moved the mouth-line slider — auto-detection must not overwrite
+    #[serde(default)]
+    pub split_manual: bool,
+    /// how the next photo upload is processed
+    #[serde(default)]
+    pub photo_mode: PhotoMode,
+    #[serde(default)]
+    pub talk_anim: TalkAnim,
+    #[serde(default)]
+    pub idle_anim: IdleAnim,
+    /// second still shown while talking (talk_anim == swap)
+    #[serde(default)]
+    pub photo_talk: Option<PathBuf>,
+    /// per-frame delays (ms) of an animated avatar; empty = still photo.
+    /// frame files live next to `photo` as photos/{id}.f{n}.png
+    #[serde(default)]
+    pub frame_ms: Vec<u32>,
     pub accent: Accent,
     pub quotes: Vec<Quote>,
     /// canned fallback lines used by "remix" expansion when no AI is configured
@@ -208,6 +312,12 @@ fn default_friends() -> Vec<Friend> {
             name: "marc".into(),
             photo: None,
             split: 0.52,
+            split_manual: false,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Flap,
+            idle_anim: IdleAnim::Off,
+            photo_talk: None,
+            frame_ms: Vec::new(),
             accent: Accent::Orange,
             quotes: vec![
                 Quote::sample("Do your fucking job."),
@@ -228,6 +338,12 @@ fn default_friends() -> Vec<Friend> {
             name: "ana".into(),
             photo: None,
             split: 0.52,
+            split_manual: false,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Flap,
+            idle_anim: IdleAnim::Off,
+            photo_talk: None,
+            frame_ms: Vec::new(),
             accent: Accent::Lime,
             quotes: vec![
                 Quote::sample("you've got this — one thing at a time."),
@@ -247,6 +363,12 @@ fn default_friends() -> Vec<Friend> {
             name: "coach k".into(),
             photo: None,
             split: 0.52,
+            split_manual: false,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Flap,
+            idle_anim: IdleAnim::Off,
+            photo_talk: None,
+            frame_ms: Vec::new(),
             accent: Accent::Violet,
             quotes: vec![
                 Quote::sample("five more minutes of focus."),
@@ -336,6 +458,33 @@ mod tests {
         assert!(back.prefer_x11);
         assert_eq!(back.friends[0].quotes.len(), 4);
         assert!(matches!(back.friends[0].expansion, Expansion::Remix));
+        assert_eq!(back.friends[0].photo_mode, PhotoMode::Auto);
+        assert_eq!(back.friends[0].talk_anim, TalkAnim::Flap);
+        assert_eq!(back.friends[0].idle_anim, IdleAnim::Off);
+        assert!(back.friends[0].photo_talk.is_none());
+        assert!(back.friends[0].frame_ms.is_empty());
+        assert!(!back.friends[0].split_manual);
+    }
+
+    #[test]
+    fn photo_and_anim_options_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.friends[0].photo_mode = PhotoMode::Raw;
+        cfg.friends[0].talk_anim = TalkAnim::Swap;
+        cfg.friends[0].idle_anim = IdleAnim::Alive;
+        cfg.friends[0].photo_talk = Some(PathBuf::from("/tmp/x.talk.png"));
+        cfg.friends[0].frame_ms = vec![40, 60, 40];
+        cfg.friends[0].split_manual = true;
+        let back = cfg.roundtrip();
+        assert_eq!(back.friends[0].photo_mode, PhotoMode::Raw);
+        assert_eq!(back.friends[0].talk_anim, TalkAnim::Swap);
+        assert_eq!(back.friends[0].idle_anim, IdleAnim::Alive);
+        assert_eq!(
+            back.friends[0].photo_talk.as_deref(),
+            Some(std::path::Path::new("/tmp/x.talk.png"))
+        );
+        assert_eq!(back.friends[0].frame_ms, vec![40, 60, 40]);
+        assert!(back.friends[0].split_manual);
     }
 
     #[test]
@@ -357,5 +506,12 @@ mod tests {
         assert_eq!(cfg.gen_count, 3);
         assert_eq!(cfg.friends[0].split, 0.52);
         assert!(cfg.friends[0].pool.is_empty());
+        // photo/animation options introduced later default to today's behavior
+        assert_eq!(cfg.friends[0].photo_mode, PhotoMode::Auto);
+        assert_eq!(cfg.friends[0].talk_anim, TalkAnim::Flap);
+        assert_eq!(cfg.friends[0].idle_anim, IdleAnim::Off);
+        assert!(cfg.friends[0].photo_talk.is_none());
+        assert!(cfg.friends[0].frame_ms.is_empty());
+        assert!(!cfg.friends[0].split_manual);
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,10 @@ use egui::{
 };
 
 use crate::api::{self, ApiEvent};
-use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc, Theme};
+use crate::config::{
+    Accent, Config, Corner, Expansion, Friend, IdleAnim, PhotoMode, Quote, QuoteSrc, TalkAnim,
+    Theme,
+};
 use crate::photo;
 use crate::theme::{self, Palette};
 
@@ -36,6 +40,20 @@ enum Tab {
 struct ChatMsg {
     me: bool,
     t: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum UploadSlot {
+    Base,
+    Talk,
+}
+
+/// GPU-side avatar: one frame for stills, several for animated files,
+/// plus the optional "talking" still for TalkAnim::Swap.
+#[derive(Clone)]
+struct AvatarTex {
+    frames: Vec<(egui::TextureHandle, u32)>,
+    talk: Option<egui::TextureHandle>,
 }
 
 struct Bubble {
@@ -75,10 +93,10 @@ pub struct MotivatorApp {
 
     api_rx: Receiver<ApiEvent>,
     api_tx: Sender<ApiEvent>,
-    photo_rx: Receiver<(String, Result<photo::Processed, String>)>,
-    photo_tx: Sender<(String, Result<photo::Processed, String>)>,
+    photo_rx: Receiver<(String, UploadSlot, Result<photo::Processed, String>)>,
+    photo_tx: Sender<(String, UploadSlot, Result<photo::Processed, String>)>,
 
-    textures: HashMap<String, egui::TextureHandle>,
+    textures: HashMap<String, AvatarTex>,
     last_applied_theme: Option<Theme>,
 }
 
@@ -296,6 +314,12 @@ impl MotivatorApp {
             name: "new friend".into(),
             photo: None,
             split: 0.52,
+            split_manual: false,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Flap,
+            idle_anim: IdleAnim::Off,
+            photo_talk: None,
+            frame_ms: Vec::new(),
             accent,
             quotes: Vec::new(),
             pool: Vec::new(),
@@ -326,18 +350,27 @@ impl MotivatorApp {
         self.mark_dirty();
     }
 
-    fn upload_photo(&mut self, ctx: &egui::Context) {
+    fn upload_photo(&mut self, ctx: &egui::Context, slot: UploadSlot) {
         let tx = self.photo_tx.clone();
         let id = self.active().id.clone();
+        let mode = self.active().photo_mode;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let title = match slot {
+                UploadSlot::Base => "pick a photo of them",
+                UploadSlot::Talk => "pick their talking frame (mouth open)",
+            };
             if let Some(path) = rfd::FileDialog::new()
-                .set_title("pick a photo of them")
-                .add_filter("images", &["png", "jpg", "jpeg", "webp"])
+                .set_title(title)
+                .add_filter("images", &["png", "jpg", "jpeg", "webp", "gif"])
                 .pick_file()
             {
-                let result = photo::process_and_store(&path, &id);
-                let _ = tx.send((id, result));
+                let stem = match slot {
+                    UploadSlot::Base => id.clone(),
+                    UploadSlot::Talk => format!("{id}.talk"),
+                };
+                let result = photo::process_and_store(&path, &stem, mode);
+                let _ = tx.send((id, slot, result));
                 ctx.request_repaint();
             }
         });
@@ -389,12 +422,31 @@ impl MotivatorApp {
                 }
             }
         }
-        while let Ok((id, result)) = self.photo_rx.try_recv() {
+        while let Ok((id, slot, result)) = self.photo_rx.try_recv() {
             match result {
                 Ok(p) => {
                     if let Some(f) = self.cfg.friends.iter_mut().find(|f| f.id == id) {
-                        f.photo = Some(p.path);
-                        f.split = p.split;
+                        match slot {
+                            UploadSlot::Base => {
+                                f.photo = Some(p.path);
+                                f.frame_ms = p.frames.iter().map(|(_, ms)| *ms).collect();
+                                // a fresh photo means a fresh mouth line — the
+                                // manual-override flag belongs to the old one
+                                f.split_manual = false;
+                                if let Some(s) = p.split {
+                                    f.split = s;
+                                }
+                                // the flap needs a stable mouth line; animated
+                                // frames don't have one
+                                if !f.frame_ms.is_empty() && f.talk_anim == TalkAnim::Flap {
+                                    f.talk_anim = TalkAnim::Bounce;
+                                }
+                            }
+                            UploadSlot::Talk => {
+                                f.photo_talk = Some(p.path);
+                                f.talk_anim = TalkAnim::Swap;
+                            }
+                        }
                     }
                     self.textures.remove(&id);
                     self.photo_note.clear();
@@ -449,17 +501,31 @@ impl MotivatorApp {
         }
     }
 
-    fn texture(&mut self, ctx: &egui::Context, friend_idx: usize) -> Option<egui::TextureHandle> {
+    fn avatar_tex(&mut self, ctx: &egui::Context, friend_idx: usize) -> Option<AvatarTex> {
         let f = &self.cfg.friends[friend_idx];
-        let path = f.photo.clone()?;
+        let base = f.photo.clone()?;
         let id = f.id.clone();
         if let Some(t) = self.textures.get(&id) {
             return Some(t.clone());
         }
-        let img = image::open(&path).ok()?.to_rgba8();
-        let size = [img.width() as usize, img.height() as usize];
-        let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-        let tex = ctx.load_texture(format!("photo-{id}"), color, egui::TextureOptions::LINEAR);
+        let mut frames = Vec::new();
+        if !f.frame_ms.is_empty() {
+            let dir = base.parent().map(Path::to_path_buf).unwrap_or_default();
+            for (n, &ms) in f.frame_ms.iter().enumerate() {
+                let p = dir.join(format!("{id}.f{n}.png"));
+                if let Some(t) = load_tex(ctx, &p, format!("photo-{id}-f{n}")) {
+                    frames.push((t, ms.max(20)));
+                }
+            }
+        }
+        if frames.is_empty() {
+            frames.push((load_tex(ctx, &base, format!("photo-{id}"))?, 0));
+        }
+        let talk = f
+            .photo_talk
+            .clone()
+            .and_then(|p| load_tex(ctx, &p, format!("photo-{id}-talk")));
+        let tex = AvatarTex { frames, talk };
         self.textures.insert(id, tex.clone());
         Some(tex)
     }
@@ -530,8 +596,8 @@ impl MotivatorApp {
         let has_photo = f.photo.is_some();
         let (rect, _) = ui.allocate_exact_size(vec2(px, px), Sense::hover());
         if has_photo {
-            if let Some(tex) = self.texture(ctx, idx) {
-                draw_contain_bottom(ui.painter(), &tex, rect, 1.0);
+            if let Some(av) = self.avatar_tex(ctx, idx) {
+                draw_contain_bottom(ui.painter(), &av.frames[0].0, rect, 1.0);
                 return;
             }
         }
@@ -562,6 +628,9 @@ impl MotivatorApp {
         let nudges = f.nudges;
         let has_photo = f.photo.is_some();
         let split = f.split.clamp(0.1, 0.9);
+        let talk_anim = f.talk_anim;
+        let idle_anim = f.idle_anim;
+        let animated = !f.frame_ms.is_empty();
         let letter = f
             .name
             .trim()
@@ -589,21 +658,75 @@ impl MotivatorApp {
         let rounding = CornerRadius::same((px * 0.22) as u8);
 
         // talking animation offsets
-        let (mut bob, mut flap) = (0.0f32, 0.0f32);
+        let (mut bob, mut flap, mut shimmy, mut swap_frame) = (0.0f32, 0.0f32, 0.0f32, false);
         if let Some(start) = self.speak_start {
             let t = Instant::now().duration_since(start).as_secs_f32();
             if t < SPEAK_SECS {
-                bob = -2.0 * (std::f32::consts::PI * (t / 0.85).fract()).sin();
-                if t < 0.27 * 6.0 {
-                    flap = -((std::f32::consts::PI * (t / 0.27).fract()).sin());
+                let cadence = (std::f32::consts::PI * (t / 0.27).fract()).sin();
+                match talk_anim {
+                    TalkAnim::Flap => {
+                        bob = -2.0 * (std::f32::consts::PI * (t / 0.85).fract()).sin();
+                        if t < 0.27 * 6.0 {
+                            flap = -cadence;
+                        }
+                    }
+                    TalkAnim::Bounce => bob = -3.0 * cadence.abs(),
+                    TalkAnim::Sway => {
+                        shimmy = 2.0 * (std::f32::consts::TAU * (t / 0.54).fract()).sin()
+                    }
+                    TalkAnim::Swap => swap_frame = (t / 0.27) as i32 % 2 == 1,
+                    TalkAnim::None => {}
                 }
                 ui.ctx().request_repaint();
             }
         }
 
+        // idle animation offsets — continuous, so they get their own repaints
+        let (mut idle_dx, mut idle_dy, mut breathe) = (0.0f32, 0.0f32, 0.0f32);
+        if has_photo && idle_anim != IdleAnim::Off {
+            let now = ui.input(|i| i.time) as f32;
+            let tau = std::f32::consts::TAU;
+            if matches!(idle_anim, IdleAnim::Breathe | IdleAnim::Alive) {
+                breathe = 0.015 * (now * tau / 2.4).sin();
+            }
+            if matches!(idle_anim, IdleAnim::Sway | IdleAnim::Alive) {
+                idle_dx = 1.5 * (now * tau / 3.1).sin();
+            }
+            if idle_anim == IdleAnim::Alive {
+                // a brief micro-bob every ~7 s
+                let phase = (now / 7.0).fract();
+                if phase < 0.08 {
+                    idle_dy = -2.0 * (std::f32::consts::PI * phase / 0.08).sin();
+                }
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+
         let painter = ui.painter();
         if has_photo {
-            if let Some(tex) = self.texture(ctx, idx) {
+            if let Some(av) = self.avatar_tex(ctx, idx) {
+                // current frame: wall-clock loop over the per-frame delays
+                let mut tex = &av.frames[0].0;
+                if av.frames.len() > 1 {
+                    let total: u32 = av.frames.iter().map(|(_, ms)| *ms).sum::<u32>().max(1);
+                    let now_ms = (ui.input(|i| i.time) * 1000.0) as u32 % total;
+                    let mut acc = 0u32;
+                    for (t, ms) in &av.frames {
+                        acc += ms;
+                        if now_ms < acc {
+                            tex = t;
+                            ui.ctx().request_repaint_after(Duration::from_millis(
+                                (acc - now_ms) as u64,
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if swap_frame {
+                    if let Some(t) = &av.talk {
+                        tex = t;
+                    }
+                }
                 let boxr = Rect::from_min_max(
                     Pos2::new(tile.min.x - 0.10 * px, tile.min.y - 0.32 * px),
                     tile.max,
@@ -611,24 +734,33 @@ impl MotivatorApp {
                 let ts = tex.size_vec2();
                 let scale = (boxr.width() / ts.x).min(boxr.height() / ts.y);
                 let dw = ts.x * scale;
-                let dh = ts.y * scale;
-                let x0 = boxr.center().x - dw / 2.0;
-                let y0 = boxr.max.y - dh + bob;
-                let head_h = split * dh;
-                // subtle jaw-snap: a wide-open gap reads as "sliced" on tight
-                // face crops, so keep the lift at 5% of head height
-                let flap_px = flap * 0.05 * head_h;
+                // breathing stretches the sprite from its bottom anchor
+                let dh = ts.y * scale * (1.0 + breathe);
+                let x0 = boxr.center().x - dw / 2.0 + idle_dx + shimmy;
+                let y0 = boxr.max.y - dh + bob + idle_dy;
                 let mut mesh = egui::Mesh::with_texture(tex.id());
-                mesh.add_rect_with_uv(
-                    Rect::from_min_size(Pos2::new(x0, y0 + flap_px), vec2(dw, head_h)),
-                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, split)),
-                    Color32::WHITE,
-                );
-                mesh.add_rect_with_uv(
-                    Rect::from_min_size(Pos2::new(x0, y0 + head_h), vec2(dw, dh - head_h)),
-                    Rect::from_min_max(Pos2::new(0.0, split), Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                if talk_anim == TalkAnim::Flap && !animated {
+                    let head_h = split * dh;
+                    // subtle jaw-snap: a wide-open gap reads as "sliced" on tight
+                    // face crops, so keep the lift at 5% of head height
+                    let flap_px = flap * 0.05 * head_h;
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y0 + flap_px), vec2(dw, head_h)),
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, split)),
+                        Color32::WHITE,
+                    );
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y0 + head_h), vec2(dw, dh - head_h)),
+                        Rect::from_min_max(Pos2::new(0.0, split), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y0), vec2(dw, dh)),
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
                 ui.painter().add(egui::Shape::mesh(mesh));
             }
         } else {
@@ -1096,12 +1228,15 @@ impl MotivatorApp {
                     ))
                     .clicked()
                 {
-                    self.upload_photo(ctx);
+                    self.upload_photo(ctx, UploadSlot::Base);
                 }
                 let has_photo = self.active().photo.is_some();
                 if has_photo && self.tiny_button(ui, "use letter instead").clicked() {
                     let id = self.active().id.clone();
-                    self.active_mut().photo = None;
+                    let f = self.active_mut();
+                    f.photo = None;
+                    f.photo_talk = None;
+                    f.frame_ms.clear();
                     self.textures.remove(&id);
                 }
             });
@@ -1113,6 +1248,99 @@ impl MotivatorApp {
                     .font(theme::font_label())
                     .color(pal.destructive),
             );
+        }
+        ui.label(self.label_text("photo processing (next upload)"));
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            let current = self.active().photo_mode;
+            let mut pick = None;
+            for m in PhotoMode::ALL {
+                if self.chip(ui, m.label(), m == current).clicked() {
+                    pick = Some(m);
+                }
+            }
+            if let Some(m) = pick {
+                if m != current {
+                    self.active_mut().photo_mode = m;
+                }
+            }
+        });
+        let has_photo = self.active().photo.is_some();
+        if has_photo {
+            let has_talk = self.active().photo_talk.is_some();
+            let animated = !self.active().frame_ms.is_empty();
+            ui.horizontal(|ui| {
+                let label = if has_talk {
+                    "replace talking frame"
+                } else {
+                    "+ talking frame (mouth open)"
+                };
+                if self.tiny_button(ui, label).clicked() {
+                    self.upload_photo(ctx, UploadSlot::Talk);
+                }
+                if has_talk && self.tiny_button(ui, "×").clicked() {
+                    let id = self.active().id.clone();
+                    let f = self.active_mut();
+                    f.photo_talk = None;
+                    if f.talk_anim == TalkAnim::Swap {
+                        f.talk_anim = if animated {
+                            TalkAnim::Bounce
+                        } else {
+                            TalkAnim::Flap
+                        };
+                    }
+                    self.textures.remove(&id);
+                }
+            });
+            if !animated && self.active().talk_anim == TalkAnim::Flap {
+                let mut split = self.active().split;
+                let label = self.label_text("mouth line");
+                if ui
+                    .add(egui::Slider::new(&mut split, 0.10..=0.90).text(label))
+                    .changed()
+                {
+                    let f = self.active_mut();
+                    f.split = split;
+                    f.split_manual = true;
+                }
+            }
+            ui.label(self.label_text("talking"));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                let current = self.active().talk_anim;
+                let mut pick = None;
+                for a in TalkAnim::ALL {
+                    let enabled = match a {
+                        TalkAnim::Flap => !animated,
+                        TalkAnim::Swap => has_talk,
+                        _ => true,
+                    };
+                    let clicked = ui
+                        .add_enabled_ui(enabled, |ui| self.chip(ui, a.label(), a == current))
+                        .inner
+                        .clicked();
+                    if clicked && enabled {
+                        pick = Some(a);
+                    }
+                }
+                if let Some(a) = pick {
+                    self.active_mut().talk_anim = a;
+                }
+            });
+            ui.label(self.label_text("idle"));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                let current = self.active().idle_anim;
+                let mut pick = None;
+                for a in IdleAnim::ALL {
+                    if self.chip(ui, a.label(), a == current).clicked() {
+                        pick = Some(a);
+                    }
+                }
+                if let Some(a) = pick {
+                    self.active_mut().idle_anim = a;
+                }
+            });
         }
         ui.label(
             RichText::new("name")
@@ -1570,6 +1798,13 @@ fn hline(ui: &mut egui::Ui, pal: &Palette, w: f32) {
     );
 }
 
+fn load_tex(ctx: &egui::Context, path: &Path, name: String) -> Option<egui::TextureHandle> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
+}
+
 fn draw_contain_bottom(
     painter: &egui::Painter,
     tex: &egui::TextureHandle,
@@ -1650,6 +1885,12 @@ mod tests {
             name: "t".into(),
             photo: None,
             split: 0.52,
+            split_manual: false,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Flap,
+            idle_anim: IdleAnim::Off,
+            photo_talk: None,
+            frame_ms: Vec::new(),
             accent: Accent::Orange,
             quotes: vec![
                 Quote {
