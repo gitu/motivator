@@ -8,6 +8,7 @@ use egui::{
 };
 
 use crate::api::{self, ApiEvent};
+use crate::autostart;
 use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc, TokenParam};
 use crate::photo;
 use crate::schedule;
@@ -104,6 +105,9 @@ pub struct MotivatorApp {
     api_note: String,
     photo_note: String,
     share_note: String,
+    /// cached is_enabled() — the entry on disk is the source of truth
+    autostart: bool,
+    autostart_note: String,
 
     api_rx: Receiver<ApiEvent>,
     api_tx: Sender<ApiEvent>,
@@ -172,6 +176,8 @@ impl MotivatorApp {
             api_note: String::new(),
             photo_note: String::new(),
             share_note: String::new(),
+            autostart: autostart::is_enabled(),
+            autostart_note: String::new(),
             api_rx,
             api_tx,
             photo_rx,
@@ -1014,6 +1020,11 @@ impl MotivatorApp {
         });
         if let Some(panel) = open {
             self.panel = Some(panel);
+            // pick up external changes (e.g. a hand-deleted autostart entry)
+            if panel == Panel::Config {
+                self.autostart = autostart::is_enabled();
+                self.autostart_note.clear();
+            }
         }
     }
 
@@ -1774,6 +1785,29 @@ impl MotivatorApp {
             .changed()
         {
             self.mark_dirty();
+        }
+        {
+            let mut autostart = self.autostart;
+            if ui
+                .checkbox(
+                    &mut autostart,
+                    RichText::new("start on login").font(theme::font_ui()),
+                )
+                .changed()
+            {
+                // acts on the system entry directly — nothing goes through config
+                match autostart::set_enabled(autostart) {
+                    Ok(()) => {
+                        self.autostart = autostart;
+                        self.autostart_note.clear();
+                    }
+                    Err(e) => self.autostart_note = e,
+                }
+            }
+            if !self.autostart_note.is_empty() {
+                let note = self.autostart_note.clone();
+                ui.label(self.label_text(&note));
+            }
         }
     }
 

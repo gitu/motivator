@@ -2,6 +2,7 @@
 
 mod api;
 mod app;
+mod autostart;
 mod config;
 mod photo;
 mod schedule;

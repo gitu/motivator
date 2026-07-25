@@ -45,6 +45,8 @@ actually say — with a little talking animation. Teach it which lines land with
   file, import via friends → paste card
 - **sizes** — avatar size 56–96 px, bubble duration, corner, all in config →
   behavior; dark/light theme follows the system preference automatically
+- **start on login** — optional autostart toggle in config → behavior (XDG
+  autostart on Linux, login item on macOS, registry Run key on Windows)
 
 ## install
 
@@ -84,7 +86,9 @@ cargo build --release
 ```
 
 Requires only a working display (X11 or Wayland/XWayland) — no webview,
-no system tray, no daemons.
+no system tray, no daemons. The opt-in *start on login* toggle registers a
+plain autostart entry with your desktop; it doesn't run anything in the
+background either.
 
 ## AI endpoint (OpenAI-compatible, static token)
 
