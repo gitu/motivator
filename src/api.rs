@@ -25,29 +25,33 @@ pub fn configured(api: &ApiConfig) -> bool {
 
 fn complete(api: &ApiConfig, prompt: &str) -> Result<String, String> {
     let url = format!("{}/chat/completions", api.base_url.trim_end_matches('/'));
-    let mut req = ureq::post(&url).set("Content-Type", "application/json");
+    // report http error bodies ourselves instead of ureq's bare status error
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut req = agent.post(&url).header("Content-Type", "application/json");
     let key = api.api_key.trim();
     if !key.is_empty() {
-        req = req.set("Authorization", &format!("Bearer {key}"));
+        req = req.header("Authorization", format!("Bearer {key}"));
     }
-    let resp = req
+    let mut resp = req
         .send_json(json!({
             "model": api.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.9,
             "max_tokens": 200,
         }))
-        .map_err(|e| match e {
-            ureq::Error::Status(code, r) => {
-                let body = r.into_string().unwrap_or_default();
-                format!(
-                    "http {code}: {}",
-                    body.chars().take(200).collect::<String>()
-                )
-            }
-            other => other.to_string(),
-        })?;
-    let body: Value = resp.into_json().map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!(
+            "http {code}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    let body: Value = resp.body_mut().read_json().map_err(|e| e.to_string())?;
     let text = body["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| "malformed response (no choices[0].message.content)".to_string())?;
@@ -148,9 +152,14 @@ mod tests {
                         raw.extend_from_slice(&buf[..n]);
                         let req = String::from_utf8_lossy(&raw);
                         if let Some(head_end) = req.find("\r\n\r\n") {
+                            // header names are case-insensitive (ureq 3 lowercases them)
                             let want: usize = req
                                 .lines()
-                                .find_map(|l| l.strip_prefix("Content-Length: "))
+                                .find_map(|l| {
+                                    l.to_lowercase()
+                                        .strip_prefix("content-length: ")
+                                        .map(str::to_string)
+                                })
                                 .and_then(|v| v.trim().parse().ok())
                                 .unwrap_or(0);
                             if raw.len() >= head_end + 4 + want {
@@ -186,8 +195,12 @@ mod tests {
         assert_eq!(out, "less planning. more shipping.");
         let req = handle.join().unwrap();
         assert!(req.starts_with("POST /v1/chat/completions"));
-        assert!(req.contains("Authorization: Bearer sekret-token"));
-        assert!(req.contains("\"model\":\"test-model\""));
+        // ureq 3 sends header names lowercased
+        assert!(req.contains("authorization: Bearer sekret-token"));
+        // don't depend on the client's JSON formatting
+        let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["model"], "test-model");
     }
 
     #[test]

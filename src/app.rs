@@ -1494,7 +1494,7 @@ impl MotivatorApp {
 
     fn anchor_window(&mut self, ctx: &egui::Context, content: Vec2) {
         let desired = content + Vec2::splat(2.0 * PAD);
-        let current = ctx.screen_rect().size();
+        let current = ctx.content_rect().size();
         let changed = (desired - current).abs().max_elem() > 1.0;
         if changed {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(desired));
@@ -1585,9 +1585,10 @@ impl eframe::App for MotivatorApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root.ctx().clone();
         if self.last_applied_theme != Some(self.cfg.theme) {
-            theme::apply_style(ctx, self.pal());
+            theme::apply_style(&ctx, self.pal());
             self.last_applied_theme = Some(self.cfg.theme);
         }
         self.drain_events();
@@ -1603,15 +1604,15 @@ impl eframe::App for MotivatorApp {
         let mut content = Vec2::ZERO;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(Margin::same(PAD as i8)))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 ui.with_layout(layout, |ui| {
                     ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
-                    self.ui_stack(ui, ctx);
+                    self.ui_stack(ui, &ctx);
                     content = ui.min_rect().size();
                 });
             });
 
-        self.anchor_window(ctx, content);
+        self.anchor_window(&ctx, content);
 
         // keep timers moving without busy-repainting
         let idle = self.bubble.is_none()

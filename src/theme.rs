@@ -93,7 +93,12 @@ pub fn font_body() -> FontId {
 }
 
 pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
-    let mut style = (*ctx.style()).clone();
+    // the palette is our single source of truth, so overwrite both the light
+    // and dark style that egui 0.35 keeps side by side
+    ctx.all_styles_mut(|style| apply_to(style, pal));
+}
+
+fn apply_to(style: &mut egui::Style, pal: &Palette) {
     let v = &mut style.visuals;
     v.dark_mode = pal.background.r() < 128;
     v.override_text_color = Some(pal.foreground);
@@ -151,8 +156,6 @@ pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
     style
         .text_styles
         .insert(Monospace, FontId::new(11.0, FontFamily::Monospace));
-
-    ctx.set_style(style);
 }
 
 /// Load the design-system fonts (Instrument Sans / JetBrains Mono) with
