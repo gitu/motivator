@@ -2041,6 +2041,39 @@ mod tests {
     }
 
     #[test]
+    fn share_card_roundtrip_through_import() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        // full path a paste takes: encode the active friend, decode the card,
+        // import the result
+        let card = app.encode_active_card().unwrap();
+        let (shared, photo) = share::decode_card(&card).unwrap();
+        let expected = app.active().name.clone();
+        app.import_shared(shared, photo);
+        assert_eq!(app.cfg.friends.len(), n + 1);
+        let imported = app.cfg.friends.last().unwrap();
+        assert_eq!(imported.name, expected);
+        assert_eq!(app.cfg.active, imported.id);
+        assert!(matches!(app.panel, Some(Panel::Config)));
+        assert!(matches!(app.tab, Tab::Friend));
+        assert!(app.share_note.contains("imported"), "{}", app.share_note);
+        assert!(app.dirty_since.is_some(), "import must schedule a save");
+    }
+
+    #[test]
+    fn import_shared_surfaces_errors() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        let shared = share::decode_card(&app.encode_active_card().unwrap())
+            .unwrap()
+            .0;
+        // photo bytes that aren't an image must fail without adding a friend
+        app.import_shared(shared, Some(vec![1, 2, 3]));
+        assert_eq!(app.cfg.friends.len(), n);
+        assert!(app.share_note.contains("bad photo"), "{}", app.share_note);
+    }
+
+    #[test]
     fn mix_blends_endpoints() {
         let a = Color32::from_rgb(0, 0, 0);
         let b = Color32::from_rgb(200, 100, 50);

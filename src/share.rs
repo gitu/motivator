@@ -374,6 +374,48 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_reencode_destroys_the_card() {
+        // the documented caveat: lossy re-encoding must fail loudly, not
+        // import a corrupted friend
+        let dir = std::env::temp_dir().join("motivator-test-share-jpeg");
+        std::fs::create_dir_all(&dir).unwrap();
+        let card = encode_card(&friend(None), [80, 200, 255]).unwrap();
+        let jpg = dir.join("card.jpg");
+        image::DynamicImage::ImageRgba8(card)
+            .to_rgb8()
+            .save_with_format(&jpg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let back = image::open(&jpg).unwrap().to_rgba8();
+        assert!(decode_card(&back).is_err());
+    }
+
+    #[test]
+    fn newer_card_version_is_reported() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(MAGIC);
+        payload.push(VERSION + 1);
+        payload.extend_from_slice(&[0u8; 12]);
+        let mut img = RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 255]));
+        embed(&mut img, &payload).unwrap();
+        let err = decode_card(&img).err().expect("must be rejected");
+        assert!(err.contains("update motivator"), "{err}");
+    }
+
+    #[test]
+    fn share_photo_is_downscaled() {
+        let dir = std::env::temp_dir().join("motivator-test-share-scale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("big.png");
+        RgbaImage::from_pixel(400, 400, image::Rgba([170, 120, 90, 255]))
+            .save(&src)
+            .unwrap();
+        let card = encode_card(&friend(Some(src)), [80, 200, 255]).unwrap();
+        let (_, photo) = decode_card(&card).unwrap();
+        let photo = image::load_from_memory(&photo.unwrap()).unwrap();
+        assert!(photo.width() <= SHARE_PHOTO && photo.height() <= SHARE_PHOTO);
+    }
+
+    #[test]
     fn import_into_sanitizes_and_activates() {
         std::env::set_var(
             "XDG_DATA_HOME",
