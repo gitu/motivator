@@ -1,6 +1,7 @@
 [package]
 name = "motivator"
-version = "0.1.0"
+# Placeholder — release builds get the real version from the git tag (release.yml).
+version = "0.0.0"
 edition = "2021"
 description = "a friend in the corner of your desktop. it says the things they'd actually say."
 license = "MIT"
@@ -8,6 +9,7 @@ repository = "https://github.com/gitu/motivator"
 readme = "README.md"
 
 [dependencies]
+auto-launch = "0.6"
 eframe = "0.35"
 egui = "0.35"
 serde = { version = "1", features = ["derive"] }
@@ -16,6 +18,8 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 ureq = { version = "3", features = ["json"] }
 rfd = "0.17"
+arboard = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fastrand = "2"
 rustface = "0.1.7"
 

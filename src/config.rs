@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::schedule::{DaySet, ScheduleEntry, TimeOfDay};
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Corner {
@@ -32,13 +34,6 @@ impl Corner {
     pub fn is_right(self) -> bool {
         matches!(self, Corner::BottomRight | Corner::TopRight)
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Theme {
-    Dark,
-    Light,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +266,9 @@ impl Default for ApiConfig {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub corner: Corner,
+    /// avatar tile center in screen px after drag-and-drop; None = pin to `corner`
+    #[serde(default)]
+    pub pos: Option<(f32, f32)>,
     /// avatar edge length in logical px (design range 56..=96)
     pub avatar_size: f32,
     /// how long a bubble stays up after talking
@@ -278,7 +276,6 @@ pub struct Config {
     /// how many lines "generate with ai" asks for at once
     #[serde(default = "default_gen_count")]
     pub gen_count: u8,
-    pub theme: Theme,
     /// Wayland compositors don't let clients pick a screen position; running
     /// through XWayland does. Set false to stay native-Wayland (the widget
     /// will appear wherever the compositor decides).
@@ -287,22 +284,64 @@ pub struct Config {
     pub api: ApiConfig,
     pub friends: Vec<Friend>,
     pub active: String,
+    /// master switch for the schedule below; off = the active friend only
+    /// changes when picked by hand
+    #[serde(default)]
+    pub schedule_enabled: bool,
+    /// time windows in which a specific friend takes over the motivating,
+    /// e.g. work 09:00–17:00 on workdays, sport over lunch, wind-down in the
+    /// evening. Overlaps are fine — the shortest window wins.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleEntry>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             corner: Corner::BottomRight,
+            pos: None,
             avatar_size: 68.0,
             bubble_secs: 8.0,
             gen_count: 3,
-            theme: Theme::Dark,
             prefer_x11: true,
             api: ApiConfig::default(),
             friends: default_friends(),
             active: "marc".into(),
+            schedule_enabled: false,
+            schedule: default_schedule(),
         }
     }
+}
+
+/// Example windows wired to the default friends — visible in the schedule
+/// tab as a template, but inert until `schedule_enabled` is switched on.
+fn default_schedule() -> Vec<ScheduleEntry> {
+    vec![
+        ScheduleEntry {
+            label: "work".into(),
+            friend: "marc".into(),
+            days: DaySet::workdays(),
+            start: TimeOfDay::hm(9, 0),
+            end: TimeOfDay::hm(17, 0),
+            enabled: true,
+        },
+        ScheduleEntry {
+            label: "sport".into(),
+            friend: "coach".into(),
+            days: DaySet::workdays(),
+            start: TimeOfDay::hm(12, 0),
+            end: TimeOfDay::hm(13, 0),
+            enabled: true,
+        },
+        ScheduleEntry {
+            label: "wind down — pc away".into(),
+            friend: "ana".into(),
+            days: DaySet::every_day(),
+            start: TimeOfDay::hm(18, 0),
+            end: TimeOfDay::hm(22, 0),
+            enabled: true,
+        },
+    ]
 }
 
 fn default_friends() -> Vec<Friend> {
@@ -407,6 +446,11 @@ impl Config {
             .unwrap_or_default();
         if cfg.friends.is_empty() {
             cfg.friends = default_friends();
+            // only a fresh/wiped config gets the example windows — never
+            // overwrite a schedule someone has already shaped
+            if cfg.schedule.is_empty() {
+                cfg.schedule = default_schedule();
+            }
         }
         if !cfg.friends.iter().any(|f| f.id == cfg.active) {
             cfg.active = cfg.friends[0].id.clone();
@@ -451,11 +495,15 @@ mod tests {
 
     #[test]
     fn config_serde_roundtrip() {
-        let cfg = Config::default();
+        let cfg = Config {
+            pos: Some((120.5, 640.0)),
+            ..Default::default()
+        };
         let back = cfg.roundtrip();
         assert_eq!(back.friends.len(), cfg.friends.len());
         assert_eq!(back.active, "marc");
         assert!(back.prefer_x11);
+        assert_eq!(back.pos, Some((120.5, 640.0)));
         assert_eq!(back.friends[0].quotes.len(), 4);
         assert!(matches!(back.friends[0].expansion, Expansion::Remix));
         assert_eq!(back.friends[0].photo_mode, PhotoMode::Auto);
@@ -464,6 +512,42 @@ mod tests {
         assert!(back.friends[0].photo_talk.is_none());
         assert!(back.friends[0].frame_ms.is_empty());
         assert!(!back.friends[0].split_manual);
+        assert_eq!(back.schedule.len(), 3);
+        assert_eq!(back.schedule, cfg.schedule);
+        assert!(!back.schedule_enabled, "schedule ships switched off");
+    }
+
+    #[test]
+    fn default_schedule_resolves_examples() {
+        // monday: work at 10:00, sport over lunch, wind-down in the evening
+        let cfg = Config::default();
+        let friend_at = |minutes| {
+            crate::schedule::resolve(&cfg.schedule, 0, minutes)
+                .map(|i| cfg.schedule[i].friend.as_str())
+        };
+        assert_eq!(friend_at(10 * 60), Some("marc"));
+        assert_eq!(friend_at(12 * 60 + 30), Some("coach"));
+        assert_eq!(friend_at(19 * 60), Some("ana"));
+        assert_eq!(friend_at(23 * 60), None);
+        // every friend the examples point at actually exists
+        for e in &cfg.schedule {
+            assert!(cfg.friends.iter().any(|f| f.id == e.friend), "{}", e.friend);
+        }
+    }
+
+    #[test]
+    fn schedule_lives_on_config_not_on_friends() {
+        // friend cards serialize a Friend — the schedule must never ride along
+        let json = serde_json::to_string(&Config::default().friends[0]).unwrap();
+        assert!(!json.contains("schedule"));
+    }
+
+    #[test]
+    fn theme_is_no_longer_a_config_field() {
+        // the palette follows the system preference now — a saved config
+        // must not resurrect the old per-app theme choice
+        let json = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!json.contains("\"theme\""));
     }
 
     #[test]
@@ -490,6 +574,7 @@ mod tests {
     #[test]
     fn old_config_without_new_fields_still_loads() {
         // simulates a config written before prefer_x11 / split / pool existed
+        // (and after theme was still a config field — now ignored)
         let json = r#"{
             "corner": "bottom-right", "avatar_size": 68.0, "bubble_secs": 8.0,
             "theme": "dark",
@@ -504,6 +589,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.prefer_x11);
         assert_eq!(cfg.gen_count, 3);
+        assert_eq!(cfg.pos, None);
         assert_eq!(cfg.friends[0].split, 0.52);
         assert!(cfg.friends[0].pool.is_empty());
         // photo/animation options introduced later default to today's behavior
@@ -513,5 +599,9 @@ mod tests {
         assert!(cfg.friends[0].photo_talk.is_none());
         assert!(cfg.friends[0].frame_ms.is_empty());
         assert!(!cfg.friends[0].split_manual);
+        // schedule arrived later still: existing configs keep an empty
+        // schedule (no surprise example windows), and it stays off
+        assert!(cfg.schedule.is_empty());
+        assert!(!cfg.schedule_enabled);
     }
 }

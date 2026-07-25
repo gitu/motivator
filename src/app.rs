@@ -9,11 +9,13 @@ use egui::{
 };
 
 use crate::api::{self, ApiEvent};
+use crate::autostart;
 use crate::config::{
     Accent, Config, Corner, Expansion, Friend, IdleAnim, PhotoMode, Quote, QuoteSrc, TalkAnim,
-    Theme,
 };
 use crate::photo;
+use crate::schedule;
+use crate::share;
 use crate::theme::{self, Palette};
 
 /// margin inside the (transparent) window so panel shadows aren't clipped
@@ -22,18 +24,19 @@ const PAD: f32 = 16.0;
 const SCREEN_MARGIN: f32 = 24.0;
 const SPEAK_SECS: f32 = 1.7;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Panel {
     Chat,
     Friends,
     Config,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
     Friend,
     Quotes,
     Behavior,
+    Schedule,
     Api,
 }
 
@@ -62,6 +65,12 @@ struct Bubble {
     deadline: Instant,
 }
 
+/// results of friend-card work done off the UI thread (file dialogs)
+enum ShareEvent {
+    Import(Result<(share::SharedFriend, Option<Vec<u8>>), String>),
+    Note(String),
+}
+
 pub fn initial_size(_cfg: &Config) -> [f32; 2] {
     [300.0, 180.0]
 }
@@ -70,6 +79,20 @@ pub struct MotivatorApp {
     cfg: Config,
     dirty_since: Option<Instant>,
 
+    /// effective corner for this frame — the screen quadrant `cfg.pos` sits
+    /// in, or `cfg.corner` while no custom position is set
+    place: Corner,
+    /// avatar tile in window coords, recorded during layout so the window
+    /// can be anchored on the avatar afterwards
+    avatar_rect: Option<Rect>,
+    /// offset between the pointer and the avatar center while a drag is in
+    /// flight
+    drag_grab: Option<Vec2>,
+    /// window-local pointer at the last applied drag update. The window moving
+    /// under a still pointer produces no motion event, so a fresh origin with
+    /// a stale pointer must not move the avatar again (feedback runaway).
+    drag_last_ptr: Option<Pos2>,
+
     panel: Option<Panel>,
     tab: Tab,
 
@@ -77,6 +100,14 @@ pub struct MotivatorApp {
     note: Option<(String, Instant)>,
     speak_start: Option<Instant>,
     next_nudge: Option<Instant>,
+
+    /// window the schedule resolved to last tick (outer None = not yet
+    /// evaluated; inner = index into cfg.schedule, or none active)
+    last_sched_target: Option<Option<usize>>,
+    /// a hand-picked friend holds until the next schedule boundary
+    manual_override: bool,
+    /// the wall clock only needs reading about once a second
+    last_sched_check: Option<Instant>,
 
     chat: Vec<ChatMsg>,
     chat_draft: String,
@@ -90,30 +121,66 @@ pub struct MotivatorApp {
     gen_busy: bool,
     api_note: String,
     photo_note: String,
+    share_note: String,
+    /// cached is_enabled() — the entry on disk is the source of truth
+    autostart: bool,
+    autostart_note: String,
 
     api_rx: Receiver<ApiEvent>,
     api_tx: Sender<ApiEvent>,
     photo_rx: Receiver<(String, UploadSlot, Result<photo::Processed, String>)>,
     photo_tx: Sender<(String, UploadSlot, Result<photo::Processed, String>)>,
+    share_rx: Receiver<ShareEvent>,
+    share_tx: Sender<ShareEvent>,
+    /// kept for the app's lifetime — on X11 clipboard contents vanish when the
+    /// owning `Clipboard` is dropped
+    clip: Option<arboard::Clipboard>,
 
     textures: HashMap<String, AvatarTex>,
-    last_applied_theme: Option<Theme>,
+    /// resolved system theme currently in effect
+    theme: egui::Theme,
+    /// desktop preference from the portal watcher thread (None = no signal)
+    sys_theme: Option<egui::Theme>,
+    theme_rx: Receiver<egui::Theme>,
+    theme_tx: Sender<egui::Theme>,
+    style_applied: bool,
 }
 
 impl MotivatorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
         theme::install_fonts(&cc.egui_ctx);
+        let mut app = Self::from_config(cfg);
+        app.watch_system_theme(cc.egui_ctx.clone());
+        // greet with the first line in rotation, like the design's initial bubble
+        app.speak();
+        app
+    }
+
+    fn from_config(cfg: Config) -> Self {
         let (api_tx, api_rx) = channel();
         let (photo_tx, photo_rx) = channel();
-        let mut app = MotivatorApp {
+        let (share_tx, share_rx) = channel();
+        // the desktop's color-scheme preference: read once so the first frame
+        // paints correctly; new() spawns the watcher for live changes
+        let sys_theme = theme::system_theme();
+        let (theme_tx, theme_rx) = channel();
+        let place = cfg.corner;
+        MotivatorApp {
             cfg,
             dirty_since: None,
+            place,
+            avatar_rect: None,
+            drag_grab: None,
+            drag_last_ptr: None,
             panel: None,
             tab: Tab::Friend,
             bubble: None,
             note: None,
             speak_start: None,
             next_nudge: None,
+            last_sched_target: None,
+            manual_override: false,
+            last_sched_check: None,
             chat: Vec::new(),
             chat_draft: String::new(),
             typing: false,
@@ -125,20 +192,51 @@ impl MotivatorApp {
             gen_busy: false,
             api_note: String::new(),
             photo_note: String::new(),
+            share_note: String::new(),
+            autostart: autostart::is_enabled(),
+            autostart_note: String::new(),
             api_rx,
             api_tx,
             photo_rx,
             photo_tx,
+            share_rx,
+            share_tx,
+            clip: None,
             textures: HashMap::new(),
-            last_applied_theme: None,
-        };
-        // greet with the first line in rotation, like the design's initial bubble
-        app.speak();
-        app
+            theme: sys_theme.unwrap_or(egui::Theme::Dark),
+            sys_theme,
+            theme_rx,
+            theme_tx,
+            style_applied: false,
+        }
+    }
+
+    /// Watch the desktop's color-scheme preference from a thread — winit
+    /// delivers no theme events on X11/Wayland, so we poll.
+    fn watch_system_theme(&self, egui_ctx: egui::Context) {
+        let theme_tx = self.theme_tx.clone();
+        let mut last = self.sys_theme;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let t = theme::system_theme();
+            if t != last {
+                last = t;
+                if let Some(t) = t {
+                    if theme_tx.send(t).is_err() {
+                        return;
+                    }
+                    egui_ctx.request_repaint();
+                }
+            }
+        });
     }
 
     fn pal(&self) -> &'static Palette {
-        theme::palette(self.cfg.theme)
+        theme::palette(self.theme)
+    }
+
+    fn placement(&self, monitor: Option<Vec2>) -> Corner {
+        effective_corner(self.cfg.pos, self.cfg.corner, monitor)
     }
 
     fn active_idx(&self) -> usize {
@@ -284,20 +382,33 @@ impl MotivatorApp {
         }
     }
 
-    fn pick_friend(&mut self, id: &str) {
-        if id == self.cfg.active {
-            self.panel = None;
-            return;
-        }
+    /// make `id` the active friend and reset everything that belongs to one
+    /// friend (chat, bubble, nudge timer) — shared by hand picks and the
+    /// schedule
+    fn switch_friend(&mut self, id: &str) {
         self.cfg.active = id.to_string();
         self.chat.clear();
         self.typing = false;
         self.pending_reply = None;
         self.bubble = None;
         self.next_nudge = None;
-        self.panel = None;
         self.mark_dirty();
         self.speak();
+    }
+
+    /// a friend was picked by hand — the schedule backs off until its next
+    /// window boundary
+    fn note_manual_pick(&mut self) {
+        self.manual_override = self.cfg.schedule_enabled;
+    }
+
+    fn pick_friend(&mut self, id: &str) {
+        self.panel = None;
+        if id == self.cfg.active {
+            return;
+        }
+        self.note_manual_pick();
+        self.switch_friend(id);
     }
 
     fn add_friend(&mut self) {
@@ -333,6 +444,7 @@ impl MotivatorApp {
         self.bubble = None;
         self.chat.clear();
         self.next_nudge = None;
+        self.note_manual_pick();
         self.mark_dirty();
     }
 
@@ -346,6 +458,7 @@ impl MotivatorApp {
             self.bubble = None;
             self.chat.clear();
             self.next_nudge = None;
+            self.note_manual_pick();
         }
         self.mark_dirty();
     }
@@ -374,6 +487,135 @@ impl MotivatorApp {
                 ctx.request_repaint();
             }
         });
+    }
+
+    fn clipboard(&mut self) -> Result<&mut arboard::Clipboard, String> {
+        if self.clip.is_none() {
+            self.clip = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        Ok(self.clip.as_mut().unwrap())
+    }
+
+    fn encode_active_card(&self) -> Result<image::RgbaImage, String> {
+        let f = self.active();
+        let accent = self.pal().accent_color(f.accent);
+        share::encode_card(f, [accent.r(), accent.g(), accent.b()])
+    }
+
+    fn share_copy(&mut self) {
+        let card = match self.encode_active_card() {
+            Ok(c) => c,
+            Err(e) => {
+                self.share_note = e;
+                return;
+            }
+        };
+        let data = arboard::ImageData {
+            width: card.width() as usize,
+            height: card.height() as usize,
+            bytes: card.into_raw().into(),
+        };
+        self.share_note = match self
+            .clipboard()
+            .and_then(|c| c.set_image(data).map_err(|e| e.to_string()))
+        {
+            Ok(()) => "card copied — paste it anywhere".into(),
+            Err(e) => format!("clipboard failed: {e}"),
+        };
+    }
+
+    fn share_save(&mut self, ctx: &egui::Context) {
+        let card = match self.encode_active_card() {
+            Ok(c) => c,
+            Err(e) => {
+                self.share_note = e;
+                return;
+            }
+        };
+        let name = self.active().name.replace(char::is_whitespace, "-");
+        let tx = self.share_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("save friend card")
+                .set_file_name(format!("{name}-card.png"))
+                .add_filter("png image", &["png"])
+                .save_file()
+            {
+                // always PNG regardless of typed extension — a lossy format
+                // would destroy the embedded config
+                let note = match card.save_with_format(&path, image::ImageFormat::Png) {
+                    Ok(()) => format!("card saved to {}", path.display()),
+                    Err(e) => format!("save failed: {e}"),
+                };
+                let _ = tx.send(ShareEvent::Note(note));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn share_paste(&mut self) {
+        let img = match self
+            .clipboard()
+            .and_then(|c| c.get_image().map_err(|e| e.to_string()))
+        {
+            Ok(i) => i,
+            Err(_) => {
+                self.share_note = "no image in the clipboard".into();
+                return;
+            }
+        };
+        let Some(rgba) =
+            image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+        else {
+            self.share_note = "clipboard image was malformed".into();
+            return;
+        };
+        match share::decode_card(&rgba) {
+            Ok((s, photo)) => self.import_shared(s, photo),
+            Err(e) => self.share_note = e,
+        }
+    }
+
+    fn share_open(&mut self, ctx: &egui::Context) {
+        let tx = self.share_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("open a friend card")
+                .add_filter("png image", &["png"])
+                .pick_file()
+            {
+                let result = image::open(&path)
+                    .map_err(|e| format!("could not read image: {e}"))
+                    .and_then(|img| share::decode_card(&img.to_rgba8()));
+                let _ = tx.send(ShareEvent::Import(result));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn import_shared(&mut self, s: share::SharedFriend, photo_png: Option<Vec<u8>>) {
+        let name = if s.name.is_empty() {
+            "friend".to_string()
+        } else {
+            s.name.clone()
+        };
+        match share::import_into(&mut self.cfg, s, photo_png) {
+            Ok(_) => {
+                self.share_note = format!("imported {name}");
+                self.panel = Some(Panel::Config);
+                self.tab = Tab::Friend;
+                self.bubble = None;
+                self.chat.clear();
+                self.next_nudge = None;
+                // importing switches to the new friend — don't let a running
+                // window instantly switch away again
+                self.note_manual_pick();
+                self.mark_dirty();
+            }
+            Err(e) => self.share_note = e,
+        }
     }
 
     fn drain_events(&mut self) {
@@ -420,6 +662,13 @@ impl MotivatorApp {
                         Err(e) => format!("failed: {e}"),
                     }
                 }
+            }
+        }
+        while let Ok(ev) = self.share_rx.try_recv() {
+            match ev {
+                ShareEvent::Note(n) => self.share_note = n,
+                ShareEvent::Import(Ok((s, photo))) => self.import_shared(s, photo),
+                ShareEvent::Import(Err(e)) => self.share_note = e,
             }
         }
         while let Ok((id, slot, result)) = self.photo_rx.try_recv() {
@@ -479,6 +728,20 @@ impl MotivatorApp {
                 self.speak_start = None;
             }
         }
+        if self.cfg.schedule_enabled {
+            let due = self
+                .last_sched_check
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
+            if due {
+                self.last_sched_check = Some(now);
+                let (day, minutes) = local_day_minutes();
+                self.apply_schedule(day, minutes);
+            }
+        } else {
+            self.last_sched_target = None;
+            self.manual_override = false;
+            self.last_sched_check = None;
+        }
         let f = self.active();
         if f.nudges {
             let interval = Duration::from_secs(f.interval_secs.max(5));
@@ -499,6 +762,34 @@ impl MotivatorApp {
                 self.dirty_since = None;
             }
         }
+    }
+
+    /// Evaluate the schedule at (day 0 = mon … 6 = sun, minutes since
+    /// midnight) and switch the active friend if a window says so. Kept
+    /// clock-free so tests can walk through a day.
+    fn apply_schedule(&mut self, day: u8, minutes: u16) {
+        let target = schedule::resolve(&self.cfg.schedule, day, minutes);
+        let (switch, manual, last) =
+            schedule_step(self.last_sched_target, target, self.manual_override);
+        self.manual_override = manual;
+        self.last_sched_target = last;
+        if !switch {
+            return;
+        }
+        let Some(idx) = target else { return };
+        let id = self.cfg.schedule[idx].friend.clone();
+        // entries pointing at a deleted friend simply never fire
+        if id != self.cfg.active && self.cfg.friends.iter().any(|f| f.id == id) {
+            self.switch_friend(&id);
+        }
+    }
+
+    /// the schedule was edited — re-evaluate from scratch on the next tick
+    /// (stored window indices may have shifted)
+    fn reset_schedule_state(&mut self) {
+        self.last_sched_target = None;
+        self.manual_override = false;
+        self.last_sched_check = None;
     }
 
     fn avatar_tex(&mut self, ctx: &egui::Context, friend_idx: usize) -> Option<AvatarTex> {
@@ -532,6 +823,23 @@ impl MotivatorApp {
 
     // ---------------------------------------------------------------- UI --
 
+    /// small pill selector used by the photo/animation option rows
+    fn chip(&self, ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+        let pal = self.pal();
+        let (bg, fg) = if active {
+            (pal.accent, pal.foreground)
+        } else {
+            (pal.card, pal.muted_fg)
+        };
+        let resp = ui.add(
+            egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
+                .fill(bg)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .corner_radius(CornerRadius::same(20)),
+        );
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
     fn label_text(&self, s: &str) -> RichText {
         RichText::new(s.to_uppercase())
             .font(theme::font_label())
@@ -551,6 +859,27 @@ impl MotivatorApp {
         )
     }
 
+    /// tiny weekday toggle for schedule rows — filled while the day is on
+    fn day_toggle(&self, ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+        let pal = self.pal();
+        let (bg, fg) = if on {
+            (pal.accent, pal.foreground)
+        } else {
+            (Color32::TRANSPARENT, pal.muted_fg)
+        };
+        ui.add(
+            egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
+                .fill(bg)
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if on { pal.border } else { Color32::TRANSPARENT },
+                ))
+                .corner_radius(CornerRadius::same(5))
+                .min_size(vec2(16.0, 16.0)),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
     fn panel_frame(&self) -> egui::Frame {
         let pal = self.pal();
         egui::Frame::new()
@@ -564,22 +893,6 @@ impl MotivatorApp {
                 spread: 0,
                 color: Color32::from_black_alpha(pal.shadow_alpha),
             })
-    }
-
-    fn chip(&self, ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
-        let pal = self.pal();
-        let (bg, fg) = if active {
-            (pal.accent, pal.foreground)
-        } else {
-            (pal.card, pal.muted_fg)
-        };
-        let resp = ui.add(
-            egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
-                .fill(bg)
-                .stroke(Stroke::new(1.0_f32, pal.border))
-                .corner_radius(CornerRadius::same(20)),
-        );
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
     fn mini_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, px: f32) {
@@ -641,20 +954,29 @@ impl MotivatorApp {
         let name = if f.name.is_empty() { "friend" } else { &f.name };
         let hover_id = ui.id().with("avatar");
 
-        // with a photo the cut-out head pops above and beside the tile
-        let alloc = if has_photo {
-            vec2(px * 1.20, px * 1.34)
+        let alloc = avatar_alloc(px, has_photo);
+        let (rect, _) = ui.allocate_exact_size(alloc, Sense::hover());
+        // a fixed id keeps the drag alive when crossing the screen's center
+        // line mid-drag — the stack reflows and auto ids would change
+        let resp = ui.interact(rect, egui::Id::new("avatar-drag"), Sense::click_and_drag());
+        let cursor = if resp.dragged() {
+            egui::CursorIcon::Grabbing
         } else {
-            vec2(px, px + 2.0)
+            egui::CursorIcon::PointingHand
         };
-        let (rect, resp) = ui.allocate_exact_size(alloc, Sense::click());
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let resp = resp.on_hover_cursor(cursor);
         let _ = name;
         let lift = if resp.hovered() { 2.0 } else { 0.0 };
         let tile = Rect::from_min_size(
             Pos2::new(rect.center().x - px / 2.0, rect.max.y - px - lift),
             vec2(px, px),
         );
+        // anchor on the lift-free tile so hover doesn't jiggle the window
+        let anchor = Rect::from_min_size(
+            Pos2::new(rect.center().x - px / 2.0, rect.max.y - px),
+            vec2(px, px),
+        );
+        self.avatar_rect = Some(anchor);
         let rounding = CornerRadius::same((px * 0.22) as u8);
 
         // talking animation offsets
@@ -793,37 +1115,81 @@ impl MotivatorApp {
         }
         let _ = hover_id;
 
+        // drag the friend anywhere on screen; the window follows the stored
+        // position in anchor_window. Screen-space pointer = window origin +
+        // window-local pointer — a plain drag delta reads ~0 because the
+        // window moves with the mouse.
+        let origin = ui.ctx().input(|i| i.viewport().inner_rect.map(|r| r.min));
+        if resp.drag_started() {
+            if origin.is_some() {
+                self.drag_grab = resp.interact_pointer_pos().map(|p| p - anchor.center());
+                self.drag_last_ptr = resp.interact_pointer_pos();
+            } else {
+                // native Wayland never reports the window position — hand the
+                // move to the compositor instead (position won't persist)
+                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+        }
+        if resp.dragged() {
+            if let (Some(grab), Some(o), Some(p)) =
+                (self.drag_grab, origin, resp.interact_pointer_pos())
+            {
+                if let Some(center) = drag_update(o, p, self.drag_last_ptr, grab) {
+                    self.drag_last_ptr = Some(p);
+                    self.cfg.pos = Some((center.x, center.y));
+                    self.mark_dirty();
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.drag_grab = None;
+            self.drag_last_ptr = None;
+        }
+
         if resp.clicked() {
             self.speak();
         }
+        let mut open: Option<Panel> = None;
         resp.context_menu(|ui| {
+            for (panel, label) in [
+                (Panel::Chat, "chat"),
+                (Panel::Friends, "friends"),
+                (Panel::Config, "config"),
+            ] {
+                if ui.button(label).clicked() {
+                    open = Some(panel);
+                    ui.close();
+                }
+            }
+            ui.separator();
             if ui.button("quit motivator").clicked() {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
             }
         });
+        if let Some(panel) = open {
+            self.panel = Some(panel);
+            // pick up external changes (e.g. a hand-deleted autostart entry)
+            if panel == Panel::Config {
+                self.autostart = autostart::is_enabled();
+                self.autostart_note.clear();
+            }
+        }
     }
 
     fn avatar_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let right = self.cfg.corner.is_right();
+        let right = self.place.is_right();
         let layout = if right {
             Layout::right_to_left(Align::BOTTOM)
         } else {
             Layout::left_to_right(Align::BOTTOM)
         };
-        ui.with_layout(layout, |ui| {
+        // fixed row height — a height-unbounded child would bottom-align into
+        // all remaining space and feed the window-size loop when the row sits
+        // on top of the stack (top placements)
+        let row_h = avatar_alloc(self.cfg.avatar_size, self.active().photo.is_some()).y;
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), row_h), layout, |ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             self.draw_avatar(ui, ctx);
-            ui.add_space(4.0);
-            for (panel, label) in [
-                (Panel::Config, "config"),
-                (Panel::Friends, "friends"),
-                (Panel::Chat, "chat"),
-            ] {
-                let active = self.panel == Some(panel);
-                if self.chip(ui, label, active).clicked() {
-                    self.panel = if active { None } else { Some(panel) };
-                }
-            }
         });
     }
 
@@ -1043,6 +1409,8 @@ impl MotivatorApp {
         let mut pick: Option<String> = None;
         let mut del: Option<String> = None;
         let mut add = false;
+        let mut paste = false;
+        let mut open = false;
         self.panel_frame()
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
@@ -1133,6 +1501,18 @@ impl MotivatorApp {
                             .min_size(vec2(236.0, 30.0)),
                         )
                         .clicked();
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(self.label_text("got a friend card?"));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            open = self.tiny_button(ui, "open card…").clicked();
+                            paste = self.tiny_button(ui, "paste card").clicked();
+                        });
+                    });
+                    if !self.share_note.is_empty() {
+                        let note = self.share_note.clone();
+                        ui.label(self.label_text(&note));
+                    }
                 })
             });
         if close {
@@ -1146,6 +1526,12 @@ impl MotivatorApp {
         }
         if add {
             self.add_friend();
+        }
+        if paste {
+            self.share_paste();
+        }
+        if open {
+            self.share_open(ctx);
         }
     }
 
@@ -1168,6 +1554,7 @@ impl MotivatorApp {
                     (Tab::Friend, "friend"),
                     (Tab::Quotes, "quotes"),
                     (Tab::Behavior, "behavior"),
+                    (Tab::Schedule, "schedule"),
                     (Tab::Api, "api"),
                 ];
                 egui::Frame::new()
@@ -1177,7 +1564,7 @@ impl MotivatorApp {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
                         ui.horizontal(|ui| {
-                            let w = (294.0 - 6.0 - 9.0) / 4.0;
+                            let w = (294.0 - 6.0 - 12.0) / 5.0;
                             for (tab, label) in tabs {
                                 let active = self.tab == tab;
                                 let (bg, fg) = if active {
@@ -1205,6 +1592,7 @@ impl MotivatorApp {
                     Tab::Friend => self.tab_friend(ui, ctx),
                     Tab::Quotes => self.tab_quotes(ui, ctx),
                     Tab::Behavior => self.tab_behavior(ui),
+                    Tab::Schedule => self.tab_schedule(ui),
                     Tab::Api => self.tab_api(ui, ctx),
                 }
             })
@@ -1385,6 +1773,41 @@ impl MotivatorApp {
                 self.active_mut().accent = a;
             }
         });
+        ui.label(
+            RichText::new("share")
+                .font(theme::font_ui())
+                .color(pal.foreground),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("copy card").font(theme::font_ui()),
+                ))
+                .clicked()
+            {
+                self.share_copy();
+            }
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("save card…").font(theme::font_ui()),
+                ))
+                .clicked()
+            {
+                self.share_save(ctx);
+            }
+        });
+        ui.label(self.label_text(
+            "a png of them with their whole config inside — import via friends → paste card",
+        ));
+        if !self.share_note.is_empty() {
+            let note = self.share_note.clone();
+            ui.label(
+                RichText::new(note)
+                    .font(theme::font_label())
+                    .color(pal.foreground),
+            );
+        }
     }
 
     fn tab_quotes(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1562,18 +1985,28 @@ impl MotivatorApp {
         ui.horizontal(|ui| {
             ui.label(self.label_text("corner"));
             let mut corner = self.cfg.corner;
+            let current = if self.cfg.pos.is_some() {
+                "custom (dragged)".to_string()
+            } else {
+                corner.label().to_string()
+            };
+            let mut snapped = None;
             egui::ComboBox::from_id_salt("corner")
-                .selected_text(RichText::new(corner.label()).font(theme::font_ui()))
+                .selected_text(RichText::new(current).font(theme::font_ui()))
                 .show_ui(ui, |ui| {
                     for c in Corner::ALL {
-                        ui.selectable_value(&mut corner, c, c.label());
+                        if ui.selectable_value(&mut corner, c, c.label()).clicked() {
+                            snapped = Some(c);
+                        }
                     }
                 });
-            if corner != self.cfg.corner {
-                self.cfg.corner = corner;
+            // picking a corner snaps back from a dragged position
+            if let Some(c) = snapped {
+                snap_to_corner(&mut self.cfg, c);
                 self.mark_dirty();
             }
         });
+        ui.label(self.label_text("drag the friend to place it anywhere"));
         let size_label = self.label_text("size");
         if ui
             .add(
@@ -1597,23 +2030,175 @@ impl MotivatorApp {
         {
             self.mark_dirty();
         }
-        ui.horizontal(|ui| {
-            ui.label(self.label_text("theme"));
-            let mut t = self.cfg.theme;
-            egui::ComboBox::from_id_salt("theme")
-                .selected_text(
-                    RichText::new(if t == Theme::Dark { "dark" } else { "light" })
-                        .font(theme::font_ui()),
+        {
+            let mut autostart = self.autostart;
+            if ui
+                .checkbox(
+                    &mut autostart,
+                    RichText::new("start on login").font(theme::font_ui()),
                 )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut t, Theme::Dark, "dark");
-                    ui.selectable_value(&mut t, Theme::Light, "light");
-                });
-            if t != self.cfg.theme {
-                self.cfg.theme = t;
+                .changed()
+            {
+                // acts on the system entry directly — nothing goes through config
+                match autostart::set_enabled(autostart) {
+                    Ok(()) => {
+                        self.autostart = autostart;
+                        self.autostart_note.clear();
+                    }
+                    Err(e) => self.autostart_note = e,
+                }
+            }
+            if !self.autostart_note.is_empty() {
+                let note = self.autostart_note.clone();
+                ui.label(self.label_text(&note));
+            }
+        }
+    }
+
+    fn tab_schedule(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        {
+            let mut on = self.cfg.schedule_enabled;
+            if ui
+                .checkbox(
+                    &mut on,
+                    RichText::new("switch friends on a schedule").font(theme::font_ui()),
+                )
+                .changed()
+            {
+                self.cfg.schedule_enabled = on;
+                self.reset_schedule_state();
                 self.mark_dirty();
             }
-        });
+        }
+        if self.cfg.schedule_enabled {
+            let (day, minutes) = local_day_minutes();
+            let status = match schedule::resolve(&self.cfg.schedule, day, minutes) {
+                Some(i) => {
+                    let e = &self.cfg.schedule[i];
+                    let who = self
+                        .cfg
+                        .friends
+                        .iter()
+                        .find(|f| f.id == e.friend)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("missing friend");
+                    format!("now: {} → {} · until {}", e.label, who, e.end)
+                }
+                None => "no window active right now".into(),
+            };
+            ui.label(self.label_text(&status));
+        }
+        let friends: Vec<(String, String)> = self
+            .cfg
+            .friends
+            .iter()
+            .map(|f| {
+                let name = if f.name.is_empty() {
+                    "friend".into()
+                } else {
+                    f.name.clone()
+                };
+                (f.id.clone(), name)
+            })
+            .collect();
+        let mut remove: Option<usize> = None;
+        let mut edited = false;
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                ui.set_width(294.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for i in 0..self.cfg.schedule.len() {
+                    let mut e = self.cfg.schedule[i].clone();
+                    ui.horizontal(|ui| {
+                        ui.set_max_width(294.0);
+                        ui.checkbox(&mut e.enabled, "");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut e.label)
+                                .desired_width(100.0)
+                                .font(theme::font_ui()),
+                        );
+                        let known = friends.iter().find(|(id, _)| *id == e.friend);
+                        let sel = known.map(|(_, n)| n.as_str()).unwrap_or("missing friend");
+                        let sel_color = if known.is_some() {
+                            pal.foreground
+                        } else {
+                            pal.destructive
+                        };
+                        egui::ComboBox::from_id_salt(("sched-friend", i))
+                            .width(72.0)
+                            .selected_text(
+                                RichText::new(sel).font(theme::font_ui()).color(sel_color),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (id, name) in &friends {
+                                    ui.selectable_value(&mut e.friend, id.clone(), name);
+                                }
+                            });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if self.tiny_button(ui, "×").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.set_max_width(294.0);
+                        ui.add_space(16.0);
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (d, l) in ["m", "t", "w", "t", "f", "s", "s"].iter().enumerate() {
+                            if self.day_toggle(ui, l, e.days.contains(d as u8)).clicked() {
+                                e.days.toggle(d as u8);
+                            }
+                        }
+                        ui.add_space(6.0);
+                        time_combo(ui, ("sched-start", i), &mut e.start);
+                        ui.label(self.label_text("–"));
+                        time_combo(ui, ("sched-end", i), &mut e.end);
+                    });
+                    hline(ui, pal, 290.0);
+                    if e != self.cfg.schedule[i] {
+                        self.cfg.schedule[i] = e;
+                        edited = true;
+                    }
+                }
+            });
+        if let Some(i) = remove {
+            self.cfg.schedule.remove(i);
+            edited = true;
+        }
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("+ add window")
+                        .font(theme::font_label())
+                        .color(pal.muted_fg),
+                )
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::NONE)
+                .min_size(vec2(294.0, 26.0)),
+            )
+            .clicked()
+        {
+            self.cfg.schedule.push(schedule::ScheduleEntry {
+                label: "window".into(),
+                friend: self.cfg.active.clone(),
+                days: schedule::DaySet::workdays(),
+                start: schedule::TimeOfDay::hm(9, 0),
+                end: schedule::TimeOfDay::hm(17, 0),
+                enabled: true,
+            });
+            edited = true;
+        }
+        if edited {
+            // stored window indices may have shifted — re-resolve fresh
+            self.reset_schedule_state();
+            self.mark_dirty();
+        }
+        if schedule::any_overlap(&self.cfg.schedule) {
+            ui.label(self.label_text("overlapping windows: the shortest one wins"));
+        }
+        ui.label(self.label_text("wrapping past midnight is fine, e.g. 22:00 – 01:00"));
     }
 
     fn tab_api(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1683,7 +2268,7 @@ impl MotivatorApp {
             Some(Panel::Config) => app.config_panel(ui, ctx),
             None => {}
         };
-        if self.cfg.corner.is_bottom() {
+        if self.place.is_bottom() {
             panel(self, ui);
             self.bubble_ui(ui);
             self.avatar_row(ui, ctx);
@@ -1701,25 +2286,17 @@ impl MotivatorApp {
         if changed {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(desired));
         }
-        let monitor = ctx.input(|i| i.viewport().monitor_size);
-        if let Some(m) = monitor {
-            if m.x > 1.0 && m.y > 1.0 {
-                let x = if self.cfg.corner.is_right() {
-                    m.x - desired.x - SCREEN_MARGIN + PAD
-                } else {
-                    SCREEN_MARGIN - PAD
-                };
-                let y = if self.cfg.corner.is_bottom() {
-                    m.y - desired.y - SCREEN_MARGIN + PAD
-                } else {
-                    SCREEN_MARGIN - PAD
-                };
-                let pos = Pos2::new(x.max(0.0), y.max(0.0));
-                let last = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
-                if changed || last.is_none_or(|l| (l - pos).abs().max_elem() > 2.0) {
-                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
-                }
-            }
+        let Some(m) = ctx.input(|i| i.viewport().monitor_size) else {
+            return;
+        };
+        if m.x <= 1.0 || m.y <= 1.0 {
+            return;
+        }
+        let pos = anchor_target(self.cfg.pos, self.avatar_rect, self.cfg.corner, desired, m);
+        let last = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
+        let dragging = self.drag_grab.is_some();
+        if dragging || changed || last.is_none_or(|l| (l - pos).abs().max_elem() > 2.0) {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
         }
     }
 }
@@ -1770,12 +2347,131 @@ fn adjust_weight(quotes: &mut [Quote], text: &str, dir: i32) -> bool {
     muted
 }
 
+/// One schedule evaluation step. `last` is the window resolved on the
+/// previous tick (outer None = first evaluation), `now` the one resolved
+/// this tick, `manual` the manual-override flag. Crossing a window boundary
+/// clears the override; while the override holds, nothing switches.
+/// Returns (switch to the resolved window?, override afterwards, new `last`).
+fn schedule_step(
+    last: Option<Option<usize>>,
+    now: Option<usize>,
+    manual: bool,
+) -> (bool, bool, Option<Option<usize>>) {
+    let manual = match last {
+        Some(prev) if prev != now => false, // boundary crossed
+        _ => manual,
+    };
+    (now.is_some() && !manual, manual, Some(now))
+}
+
+/// local wall clock as (days since monday, minutes since midnight)
+fn local_day_minutes() -> (u8, u16) {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    let day = now.weekday().num_days_from_monday() as u8;
+    let minutes = (now.hour() * 60 + now.minute()) as u16;
+    (day, minutes)
+}
+
 fn interval_label(secs: u64) -> String {
     INTERVALS
         .iter()
         .find(|(s, _)| *s == secs)
         .map(|(_, l)| l.to_string())
         .unwrap_or_else(|| format!("every {}s", secs))
+}
+
+/// pick a time of day in 30-minute steps
+fn time_combo(ui: &mut egui::Ui, salt: (&str, usize), t: &mut schedule::TimeOfDay) {
+    egui::ComboBox::from_id_salt(salt)
+        .width(46.0)
+        .selected_text(RichText::new(t.to_string()).font(theme::font_ui()))
+        .show_ui(ui, |ui| {
+            for step in 0..48u16 {
+                let v = schedule::TimeOfDay(step * 30);
+                ui.selectable_value(t, v, v.to_string());
+            }
+        });
+}
+
+/// which screen quadrant a point sits in — drives where bubbles/panels open
+fn quadrant(pos: Pos2, monitor: Vec2) -> Corner {
+    match (pos.x > monitor.x / 2.0, pos.y > monitor.y / 2.0) {
+        (true, true) => Corner::BottomRight,
+        (false, true) => Corner::BottomLeft,
+        (true, false) => Corner::TopRight,
+        (false, false) => Corner::TopLeft,
+    }
+}
+
+/// the quadrant of a dragged position, or the configured corner while no
+/// custom position is set (or the monitor is unknown/degenerate)
+fn effective_corner(pos: Option<(f32, f32)>, corner: Corner, monitor: Option<Vec2>) -> Corner {
+    match (pos, monitor) {
+        (Some((x, y)), Some(m)) if m.x > 1.0 && m.y > 1.0 => quadrant(Pos2::new(x, y), m),
+        _ => corner,
+    }
+}
+
+/// While dragging, the new avatar center for the current pointer — `None`
+/// when the pointer hasn't produced a fresh motion event. The window moving
+/// under a still pointer emits no X11 motion event, so a fresh origin with
+/// the stale window-local pointer must not move the avatar again (that
+/// feedback ran the window away 40px per frame).
+fn drag_update(origin: Pos2, ptr: Pos2, last_ptr: Option<Pos2>, grab: Vec2) -> Option<Pos2> {
+    (last_ptr != Some(ptr)).then(|| origin + ptr.to_vec2() - grab)
+}
+
+/// Where the window belongs: anchored on the avatar tile when a dragged
+/// position exists, else pinned to the configured corner — always clamped
+/// fully onto the monitor so growing panels never leave the screen.
+fn anchor_target(
+    pos: Option<(f32, f32)>,
+    avatar: Option<Rect>,
+    corner: Corner,
+    desired: Vec2,
+    monitor: Vec2,
+) -> Pos2 {
+    let target = match (pos, avatar) {
+        (Some((x, y)), Some(avatar)) => Pos2::new(x, y) - avatar.center().to_vec2(),
+        _ => {
+            let x = if corner.is_right() {
+                monitor.x - desired.x - SCREEN_MARGIN + PAD
+            } else {
+                SCREEN_MARGIN - PAD
+            };
+            let y = if corner.is_bottom() {
+                monitor.y - desired.y - SCREEN_MARGIN + PAD
+            } else {
+                SCREEN_MARGIN - PAD
+            };
+            Pos2::new(x, y)
+        }
+    };
+    clamp_to_monitor(target, desired, monitor)
+}
+
+fn snap_to_corner(cfg: &mut Config, corner: Corner) {
+    cfg.corner = corner;
+    cfg.pos = None;
+}
+
+/// avatar allocation — with a photo the cut-out head pops above and beside
+/// the tile. `avatar_row` reserves exactly this height; if the two drift
+/// apart the height-unbounded row feeds the window-size loop again.
+fn avatar_alloc(px: f32, has_photo: bool) -> Vec2 {
+    if has_photo {
+        vec2(px * 1.20, px * 1.34)
+    } else {
+        vec2(px, px + 2.0)
+    }
+}
+
+fn clamp_to_monitor(pos: Pos2, size: Vec2, monitor: Vec2) -> Pos2 {
+    Pos2::new(
+        pos.x.clamp(0.0, (monitor.x - size.x).max(0.0)),
+        pos.y.clamp(0.0, (monitor.y - size.y).max(0.0)),
+    )
 }
 
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -1835,15 +2531,27 @@ impl eframe::App for MotivatorApp {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        if self.last_applied_theme != Some(self.cfg.theme) {
+        while let Ok(t) = self.theme_rx.try_recv() {
+            self.sys_theme = Some(t);
+        }
+        // the portal preference wins; winit's system theme covers the
+        // platforms where it works (and its dark fallback everywhere else)
+        let resolved = self.sys_theme.unwrap_or_else(|| ctx.theme());
+        if !self.style_applied || resolved != self.theme {
+            self.theme = resolved;
             theme::apply_style(&ctx, self.pal());
-            self.last_applied_theme = Some(self.cfg.theme);
+            self.style_applied = true;
         }
         self.drain_events();
         self.tick_timers();
 
-        let corner = self.cfg.corner;
-        let layout = if corner.is_right() {
+        // a drag can die without drag_stopped (e.g. focus loss) — don't stay
+        // in forced-reposition mode once the button is up
+        if self.drag_grab.is_some() && !ctx.input(|i| i.pointer.any_down()) {
+            self.drag_grab = None;
+        }
+        self.place = self.placement(ctx.input(|i| i.viewport().monitor_size));
+        let layout = if self.place.is_right() {
             Layout::top_down(Align::Max)
         } else {
             Layout::top_down(Align::Min)
@@ -1925,6 +2633,18 @@ mod tests {
         pool.iter().map(|q| q.t.clone()).collect()
     }
 
+    fn app() -> MotivatorApp {
+        MotivatorApp::from_config(Config::default())
+    }
+
+    fn bubble(text: &str) -> Bubble {
+        Bubble {
+            text: text.into(),
+            tag: "",
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
     #[test]
     fn rotation_respects_weights_and_expansion() {
         // expansion off: only unmuted sample lines rotate
@@ -1970,5 +2690,392 @@ mod tests {
     fn interval_labels() {
         assert_eq!(interval_label(3600), "every hour");
         assert_eq!(interval_label(42), "every 42s");
+    }
+
+    #[test]
+    fn quadrant_maps_screen_halves_to_corners() {
+        let m = vec2(1920.0, 1080.0);
+        assert!(matches!(
+            quadrant(Pos2::new(1800.0, 1000.0), m),
+            Corner::BottomRight
+        ));
+        assert!(matches!(
+            quadrant(Pos2::new(100.0, 1000.0), m),
+            Corner::BottomLeft
+        ));
+        assert!(matches!(
+            quadrant(Pos2::new(1800.0, 80.0), m),
+            Corner::TopRight
+        ));
+        assert!(matches!(
+            quadrant(Pos2::new(100.0, 80.0), m),
+            Corner::TopLeft
+        ));
+        // dead center counts as top-left (not-greater-than on both axes)
+        assert!(matches!(
+            quadrant(Pos2::new(960.0, 540.0), m),
+            Corner::TopLeft
+        ));
+    }
+
+    #[test]
+    fn clamp_keeps_window_on_screen() {
+        let m = vec2(1920.0, 1080.0);
+        let size = vec2(330.0, 420.0);
+        // interior position untouched
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(500.0, 300.0), size, m),
+            Pos2::new(500.0, 300.0)
+        );
+        // hanging off bottom-right gets pulled back in
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(1800.0, 1000.0), size, m),
+            Pos2::new(1920.0 - 330.0, 1080.0 - 420.0)
+        );
+        // negative coords clamp to the origin
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(-40.0, -12.0), size, m),
+            Pos2::ZERO
+        );
+        // window larger than the monitor pins to the origin instead of NaN/flip
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(10.0, 10.0), vec2(4000.0, 4000.0), m),
+            Pos2::ZERO
+        );
+    }
+
+    #[test]
+    fn drag_update_needs_a_fresh_motion_event() {
+        let origin = Pos2::new(100.0, 100.0);
+        let ptr = Pos2::new(30.0, 40.0);
+        let grab = vec2(4.0, -2.0);
+        // fresh event: absolute reconstruction origin + ptr − grab
+        assert_eq!(
+            drag_update(origin, ptr, None, grab),
+            Some(Pos2::new(126.0, 142.0))
+        );
+        assert_eq!(
+            drag_update(origin, ptr, Some(Pos2::new(30.0, 39.0)), grab),
+            Some(Pos2::new(126.0, 142.0))
+        );
+        // runaway regression: the window moved (fresh origin) but the pointer
+        // produced no new event — the avatar must stay put
+        assert_eq!(
+            drag_update(Pos2::new(60.0, 100.0), ptr, Some(ptr), grab),
+            None
+        );
+    }
+
+    #[test]
+    fn anchor_targets_avatar_when_dragged_else_corner() {
+        let m = vec2(640.0, 560.0);
+        let desired = vec2(342.0, 274.0);
+        let avatar = Rect::from_min_size(Pos2::new(200.0, 150.0), vec2(96.0, 96.0));
+        // avatar-anchored: window pos = stored center − avatar offset in window
+        assert_eq!(
+            anchor_target(
+                Some((300.0, 300.0)),
+                Some(avatar),
+                Corner::TopLeft,
+                desired,
+                m
+            ),
+            Pos2::new(300.0 - 248.0, 300.0 - 198.0)
+        );
+        // first frames: no avatar rect yet → corner math
+        assert_eq!(
+            anchor_target(Some((300.0, 300.0)), None, Corner::BottomRight, desired, m),
+            Pos2::new(
+                640.0 - 342.0 - SCREEN_MARGIN + PAD,
+                560.0 - 274.0 - SCREEN_MARGIN + PAD
+            )
+        );
+        // smart-config regression: a config-panel-sized window opened at the
+        // bottom edge clamps fully on-screen instead of hanging off
+        let tall = vec2(362.0, 562.0);
+        let t = anchor_target(
+            Some((183.0, 522.0)),
+            Some(avatar),
+            Corner::BottomLeft,
+            tall,
+            m,
+        );
+        assert_eq!(t.y, 0.0);
+        assert!(t.x >= 0.0 && t.x + tall.x <= m.x);
+        // corner mode clamps too: taller-than-screen panel at a top corner
+        assert_eq!(
+            anchor_target(None, None, Corner::TopLeft, tall, m),
+            Pos2::new(SCREEN_MARGIN - PAD, 0.0)
+        );
+    }
+
+    #[test]
+    fn effective_corner_falls_back_to_configured() {
+        let m = Some(vec2(1920.0, 1080.0));
+        assert!(matches!(
+            effective_corner(None, Corner::BottomLeft, m),
+            Corner::BottomLeft
+        ));
+        assert!(matches!(
+            effective_corner(Some((10.0, 10.0)), Corner::BottomRight, None),
+            Corner::BottomRight
+        ));
+        // headless/first frames can report a degenerate monitor
+        assert!(matches!(
+            effective_corner(
+                Some((10.0, 10.0)),
+                Corner::BottomRight,
+                Some(vec2(0.0, 0.0))
+            ),
+            Corner::BottomRight
+        ));
+        assert!(matches!(
+            effective_corner(Some((10.0, 10.0)), Corner::BottomRight, m),
+            Corner::TopLeft
+        ));
+    }
+
+    #[test]
+    fn snap_to_corner_clears_dragged_position() {
+        let mut cfg = Config {
+            pos: Some((5.0, 5.0)),
+            ..Default::default()
+        };
+        // re-picking the already-configured corner must still snap back
+        let same = cfg.corner;
+        snap_to_corner(&mut cfg, same);
+        assert!(cfg.pos.is_none());
+        assert!(matches!(cfg.corner, Corner::BottomRight));
+    }
+
+    #[test]
+    fn avatar_alloc_covers_both_variants() {
+        assert_eq!(avatar_alloc(96.0, true), vec2(96.0 * 1.20, 96.0 * 1.34));
+        assert_eq!(avatar_alloc(68.0, false), vec2(68.0, 70.0));
+    }
+
+    #[test]
+    fn interface_hidden_by_default() {
+        let app = app();
+        assert!(app.panel.is_none(), "no panel may be open on startup");
+        assert!(app.bubble.is_none(), "greeting only happens via new()");
+    }
+
+    #[test]
+    fn pick_quote_avoids_repeating_current_bubble() {
+        let mut app = app();
+        app.active_mut().quotes = vec![Quote::sample("one"), Quote::sample("two")];
+        app.bubble = Some(bubble("one"));
+        for _ in 0..20 {
+            let (t, _) = app.pick_quote().expect("pool is non-empty");
+            assert_eq!(t, "two");
+        }
+    }
+
+    #[test]
+    fn speak_sets_bubble_and_talking_animation() {
+        let mut app = app();
+        app.speak();
+        assert!(app.bubble.is_some());
+        assert!(app.speak_start.is_some());
+    }
+
+    #[test]
+    fn react_down_mutes_and_notes() {
+        let mut app = app();
+        app.active_mut().quotes = vec![Quote::sample("go")];
+        app.bubble = Some(bubble("go"));
+        app.react(-1);
+        assert_eq!(app.active().quotes[0].w, 0);
+        let (note, _) = app.note.as_ref().expect("mute note shown");
+        assert!(note.contains("muted"), "note={note}");
+    }
+
+    #[test]
+    fn pick_friend_switches_resets_and_closes_panel() {
+        let mut app = app();
+        app.panel = Some(Panel::Chat);
+        app.chat.push(ChatMsg {
+            me: true,
+            t: "hi".into(),
+        });
+        app.pick_friend("ana");
+        assert_eq!(app.cfg.active, "ana");
+        assert!(app.panel.is_none(), "panel closes after switching");
+        assert!(app.chat.is_empty(), "chat history belongs to one friend");
+        assert!(app.bubble.is_some(), "new friend greets right away");
+    }
+
+    #[test]
+    fn pick_same_friend_only_closes_panel() {
+        let mut app = app();
+        app.panel = Some(Panel::Friends);
+        let before = app.cfg.active.clone();
+        app.pick_friend(&before);
+        assert_eq!(app.cfg.active, before);
+        assert!(app.panel.is_none());
+    }
+
+    #[test]
+    fn add_friend_opens_config_panel() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        app.add_friend();
+        assert_eq!(app.cfg.friends.len(), n + 1);
+        assert_eq!(app.cfg.active, app.cfg.friends[n].id);
+        assert_eq!(app.panel, Some(Panel::Config), "jump straight to setup");
+        assert_eq!(app.tab, Tab::Friend);
+    }
+
+    #[test]
+    fn del_friend_reassigns_active_and_keeps_last() {
+        let mut app = app();
+        let first = app.cfg.friends[0].id.clone();
+        app.pick_friend(&first);
+        app.del_friend(&first);
+        assert!(app.cfg.friends.iter().all(|f| f.id != first));
+        assert_eq!(app.cfg.active, app.cfg.friends[0].id);
+        while app.cfg.friends.len() > 1 {
+            let id = app.cfg.friends[0].id.clone();
+            app.del_friend(&id);
+        }
+        let last = app.cfg.friends[0].id.clone();
+        app.del_friend(&last);
+        assert_eq!(app.cfg.friends.len(), 1, "the last friend is undeletable");
+    }
+
+    #[test]
+    fn canned_reply_never_empty() {
+        let mut app = app();
+        app.active_mut().quotes.clear();
+        for _ in 0..20 {
+            assert!(!app.canned_reply().is_empty());
+        }
+    }
+
+    #[test]
+    fn share_card_roundtrip_through_import() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        // full path a paste takes: encode the active friend, decode the card,
+        // import the result
+        let card = app.encode_active_card().unwrap();
+        let (shared, photo) = share::decode_card(&card).unwrap();
+        let expected = app.active().name.clone();
+        app.import_shared(shared, photo);
+        assert_eq!(app.cfg.friends.len(), n + 1);
+        let imported = app.cfg.friends.last().unwrap();
+        assert_eq!(imported.name, expected);
+        assert_eq!(app.cfg.active, imported.id);
+        assert!(matches!(app.panel, Some(Panel::Config)));
+        assert!(matches!(app.tab, Tab::Friend));
+        assert!(app.share_note.contains("imported"), "{}", app.share_note);
+        assert!(app.dirty_since.is_some(), "import must schedule a save");
+    }
+
+    #[test]
+    fn import_shared_surfaces_errors() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        let shared = share::decode_card(&app.encode_active_card().unwrap())
+            .unwrap()
+            .0;
+        // photo bytes that aren't an image must fail without adding a friend
+        app.import_shared(shared, Some(vec![1, 2, 3]));
+        assert_eq!(app.cfg.friends.len(), n);
+        assert!(app.share_note.contains("bad photo"), "{}", app.share_note);
+    }
+
+    fn window(label: &str, friend: &str, start_h: u16, end_h: u16) -> schedule::ScheduleEntry {
+        schedule::ScheduleEntry {
+            label: label.into(),
+            friend: friend.into(),
+            days: schedule::DaySet::workdays(),
+            start: schedule::TimeOfDay::hm(start_h, 0),
+            end: schedule::TimeOfDay::hm(end_h, 0),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn schedule_step_state_machine() {
+        // first evaluation: switch to the resolved window, override untouched
+        assert_eq!(
+            schedule_step(None, Some(0), false),
+            (true, false, Some(Some(0)))
+        );
+        assert_eq!(schedule_step(None, None, false), (false, false, Some(None)));
+        // steady state inside a window: no boundary, override holds
+        assert_eq!(
+            schedule_step(Some(Some(0)), Some(0), true),
+            (false, true, Some(Some(0)))
+        );
+        // boundary (window change) clears the override and switches
+        assert_eq!(
+            schedule_step(Some(Some(0)), Some(1), true),
+            (true, false, Some(Some(1)))
+        );
+        // boundary out of all windows clears the override too, but nothing
+        // gets switched to
+        assert_eq!(
+            schedule_step(Some(Some(1)), None, true),
+            (false, false, Some(None))
+        );
+    }
+
+    #[test]
+    fn schedule_switches_and_respects_manual_override() {
+        let mut app = app();
+        app.cfg.schedule_enabled = true;
+        app.cfg.schedule = vec![
+            window("work", "marc", 9, 17),
+            window("sport", "coach", 12, 13),
+        ];
+        app.cfg.active = "ana".into();
+        app.apply_schedule(0, 10 * 60); // mon 10:00 → work window
+        assert_eq!(app.cfg.active, "marc");
+        assert!(app.bubble.is_some(), "the scheduled friend greets");
+        app.apply_schedule(0, 12 * 60 + 30); // lunch → the shorter sport window
+        assert_eq!(app.cfg.active, "coach");
+        app.pick_friend("ana"); // manual pick mid-window …
+        assert!(app.manual_override);
+        app.apply_schedule(0, 12 * 60 + 45); // … holds within the same window
+        assert_eq!(app.cfg.active, "ana");
+        app.apply_schedule(0, 13 * 60 + 5); // boundary: sport ended → work reasserts
+        assert_eq!(app.cfg.active, "marc");
+        assert!(!app.manual_override);
+    }
+
+    #[test]
+    fn schedule_ignores_missing_friends_and_no_windows() {
+        let mut app = app();
+        app.cfg.schedule_enabled = true;
+        app.cfg.schedule = vec![window("gym", "nobody", 0, 23)];
+        let before = app.cfg.active.clone();
+        app.apply_schedule(2, 5 * 60);
+        assert_eq!(app.cfg.active, before, "unknown friend id never fires");
+        app.cfg.schedule.clear();
+        app.apply_schedule(2, 5 * 60);
+        assert_eq!(app.cfg.active, before, "no windows → nothing happens");
+    }
+
+    #[test]
+    fn disabling_the_schedule_clears_its_state() {
+        let mut app = app();
+        app.manual_override = true;
+        app.last_sched_target = Some(Some(0));
+        app.cfg.schedule_enabled = false;
+        app.tick_timers();
+        assert!(!app.manual_override);
+        assert!(app.last_sched_target.is_none());
+    }
+
+    #[test]
+    fn mix_blends_endpoints() {
+        let a = Color32::from_rgb(0, 0, 0);
+        let b = Color32::from_rgb(200, 100, 50);
+        assert_eq!(mix(a, b, 0.0), a);
+        assert_eq!(mix(a, b, 1.0), b);
+        assert_eq!(mix(a, b, 0.5), Color32::from_rgb(100, 50, 25));
     }
 }

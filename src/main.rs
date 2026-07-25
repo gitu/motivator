@@ -2,8 +2,11 @@
 
 mod api;
 mod app;
+mod autostart;
 mod config;
 mod photo;
+mod schedule;
+mod share;
 mod theme;
 
 fn main() -> eframe::Result {
@@ -27,6 +30,52 @@ fn main() -> eframe::Result {
                 p.split.map_or("none".into(), |s| format!("{s:.3}")),
                 p.frames.len()
             ),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    // `motivator --share <friend-id> <out.png>` / `--import <card.png>` run the
+    // friend-card codec headless — useful for scripting/debugging shares
+    if args.get(1).is_some_and(|a| a == "--share") {
+        let (id, out) = (
+            args.get(2).expect("usage: --share <friend-id> <out.png>"),
+            args.get(3).expect("usage: --share <friend-id> <out.png>"),
+        );
+        let cfg = config::Config::load();
+        let Some(f) = cfg.friends.iter().find(|f| &f.id == id) else {
+            eprintln!("error: no friend with id '{id}'");
+            std::process::exit(1);
+        };
+        let sys = theme::system_theme().unwrap_or(egui::Theme::Dark);
+        let accent = theme::palette(sys).accent_color(f.accent);
+        let result = share::encode_card(f, [accent.r(), accent.g(), accent.b()]).and_then(|card| {
+            card.save_with_format(out, image::ImageFormat::Png)
+                .map_err(|e| e.to_string())
+        });
+        match result {
+            Ok(()) => println!("ok {out}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if args.get(1).is_some_and(|a| a == "--import") {
+        let src = args.get(2).expect("usage: --import <card.png>");
+        let mut cfg = config::Config::load();
+        let result = image::open(src)
+            .map_err(|e| format!("could not read image: {e}"))
+            .and_then(|img| share::decode_card(&img.to_rgba8()))
+            .and_then(|(s, photo)| share::import_into(&mut cfg, s, photo));
+        match result {
+            Ok(id) => {
+                cfg.save();
+                println!("ok imported as {id}");
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
