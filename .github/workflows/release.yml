@@ -91,3 +91,47 @@ jobs:
             on macOS use `xattr -d com.apple.quarantine motivator` after
             unpacking.
           files: ${{ matrix.archive }}
+
+  homebrew:
+    name: Update Homebrew cask
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for tap token
+        id: token
+        run: echo "have=${{ secrets.HOMEBREW_TAP_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute macOS archive checksums
+        if: steps.token.outputs.have == 'true'
+        id: sums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -p '*-macos.tar.gz'
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "arm=$(sha256sum motivator-aarch64-macos.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "intel=$(sha256sum motivator-x86_64-macos.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap
+        if: steps.token.outputs.have == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: gitu/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Bump cask
+        if: steps.token.outputs.have == 'true'
+        run: |
+          cd tap
+          sed -i \
+            -e 's/^  version ".*"$/  version "${{ steps.sums.outputs.version }}"/' \
+            -e 's/^  sha256 arm:   ".*",$/  sha256 arm:   "${{ steps.sums.outputs.arm }}",/' \
+            -e 's/^         intel: ".*"$/         intel: "${{ steps.sums.outputs.intel }}"/' \
+            Casks/motivator.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/motivator.rb
+          git diff --cached --quiet || git commit -m "motivator ${{ steps.sums.outputs.version }}"
+          git push
