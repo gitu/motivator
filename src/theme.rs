@@ -99,11 +99,11 @@ pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
     v.override_text_color = Some(pal.foreground);
     v.panel_fill = Color32::TRANSPARENT;
     v.window_fill = pal.card;
-    v.window_stroke = Stroke::new(1.0, pal.border);
+    v.window_stroke = Stroke::new(1.0_f32, pal.border);
     v.extreme_bg_color = pal.background; // text edit background
     v.faint_bg_color = pal.muted;
     v.selection.bg_fill = pal.primary.gamma_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, pal.primary);
+    v.selection.stroke = Stroke::new(1.0_f32, pal.primary);
 
     let radius = CornerRadius::same(8);
     let w = &mut v.widgets;
@@ -118,17 +118,17 @@ pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
         wv.fg_stroke.color = pal.foreground;
     }
     w.noninteractive.bg_fill = pal.card;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, pal.border);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal.border);
     w.noninteractive.fg_stroke.color = pal.muted_fg;
     w.inactive.bg_fill = pal.muted;
     w.inactive.weak_bg_fill = pal.muted;
-    w.inactive.bg_stroke = Stroke::new(1.0, pal.border);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, pal.border);
     w.hovered.bg_fill = pal.accent;
     w.hovered.weak_bg_fill = pal.accent;
-    w.hovered.bg_stroke = Stroke::new(1.0, pal.border);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, pal.border);
     w.active.bg_fill = pal.accent;
     w.active.weak_bg_fill = pal.accent;
-    w.active.bg_stroke = Stroke::new(1.0, pal.border);
+    w.active.bg_stroke = Stroke::new(1.0_f32, pal.border);
     w.open.bg_fill = pal.popover;
     w.open.weak_bg_fill = pal.popover;
 

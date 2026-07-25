@@ -517,7 +517,7 @@ impl MotivatorApp {
         let pal = self.pal();
         egui::Frame::new()
             .fill(pal.card)
-            .stroke(Stroke::new(1.0, pal.border))
+            .stroke(Stroke::new(1.0_f32, pal.border))
             .corner_radius(CornerRadius::same(12))
             .inner_margin(Margin::same(14))
             .shadow(egui::epaint::Shadow {
@@ -538,7 +538,7 @@ impl MotivatorApp {
         let resp = ui.add(
             egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
                 .fill(bg)
-                .stroke(Stroke::new(1.0, pal.border))
+                .stroke(Stroke::new(1.0_f32, pal.border))
                 .corner_radius(CornerRadius::same(20)),
         );
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -566,7 +566,12 @@ impl MotivatorApp {
         let p = ui.painter();
         let r = CornerRadius::same((px * 0.22) as u8);
         p.rect_filled(rect, r, theme::DARK.background);
-        p.rect_stroke(rect, r, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+        p.rect_stroke(
+            rect,
+            r,
+            Stroke::new(1.0_f32, pal.border),
+            StrokeKind::Inside,
+        );
         p.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -658,13 +663,13 @@ impl MotivatorApp {
             painter.rect_stroke(
                 tile,
                 rounding,
-                Stroke::new(1.0, pal.border),
+                Stroke::new(1.0_f32, pal.border),
                 StrokeKind::Inside,
             );
             painter.rect_stroke(
                 tile.shrink(1.0),
                 rounding,
-                Stroke::new(1.0, accent.gamma_multiply(0.55)),
+                Stroke::new(1.0_f32, accent.gamma_multiply(0.55)),
                 StrokeKind::Inside,
             );
             painter.text(
@@ -1079,7 +1084,7 @@ impl MotivatorApp {
                                 )
                                 .fill(bg)
                                 .stroke(if active {
-                                    Stroke::new(1.0, pal.border)
+                                    Stroke::new(1.0_f32, pal.border)
                                 } else {
                                     Stroke::NONE
                                 })
@@ -1164,7 +1169,7 @@ impl MotivatorApp {
                     ui.painter().circle_stroke(
                         rect.center(),
                         10.0,
-                        Stroke::new(2.0, pal.foreground),
+                        Stroke::new(2.0_f32, pal.foreground),
                     );
                 }
                 if resp
@@ -1548,7 +1553,7 @@ fn hline(ui: &mut egui::Ui, pal: &Palette, w: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
     ui.painter().line_segment(
         [rect.left_center(), rect.right_center()],
-        Stroke::new(1.0, pal.border),
+        Stroke::new(1.0_f32, pal.border),
     );
 }
 
