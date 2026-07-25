@@ -9,6 +9,7 @@ repository = "https://github.com/gitu/motivator"
 readme = "README.md"
 
 [dependencies]
+auto-launch = "0.6"
 eframe = "0.35"
 egui = "0.35"
 serde = { version = "1", features = ["derive"] }
