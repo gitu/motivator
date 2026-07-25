@@ -95,7 +95,9 @@ fn complete_with_cache(
         match send(api, &body) {
             Ok(reply) => return parse_reply(&reply),
             Err(SendErr::Http(code, err)) => {
-                if (400..500).contains(&code) {
+                // parameter rejections are always a 400 invalid_request_error;
+                // anything else (401, 403, 429, …) is not worth a retry
+                if code == 400 {
                     if api.token_param == TokenParam::Auto
                         && param == "max_tokens"
                         && err.contains("max_completion_tokens")
@@ -377,6 +379,20 @@ mod tests {
         let second = body_of(&reqs[1]);
         assert!(second.get("temperature").is_none());
         assert_eq!(second["max_tokens"], 200);
+    }
+
+    #[test]
+    fn only_a_400_triggers_the_fallback() {
+        // a 401 body mentioning the magic substring must not cause a retry
+        let (base_url, _handle) = mock_server_seq(vec![(401, REJECT_MAX_TOKENS)]);
+        let api = ApiConfig {
+            base_url,
+            ..Default::default()
+        };
+        let cache = AtomicBool::new(false);
+        let err = complete_with_cache(&api, "hello", &cache).unwrap_err();
+        assert!(err.starts_with("http 401:"), "{err}");
+        assert!(!cache.load(Ordering::Relaxed));
     }
 
     #[test]

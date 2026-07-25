@@ -2032,7 +2032,7 @@ impl MotivatorApp {
             );
         });
         ui.label(self.label_text(
-            "env overrides: MOTIVATOR_BASE_URL · MOTIVATOR_API_KEY · MOTIVATOR_MODEL · MOTIVATOR_MAX_TOKENS",
+            "env overrides: MOTIVATOR_BASE_URL · MOTIVATOR_API_KEY · MOTIVATOR_MODEL · MOTIVATOR_MAX_TOKENS · MOTIVATOR_TOKEN_PARAM",
         ));
     }
 
