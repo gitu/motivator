@@ -20,8 +20,10 @@ actually say — with a little talking animation. Teach it which lines land with
 
 ## features
 
-- **corner widget** — frameless, transparent, always-on-top; anchors to any of
-  the four screen corners and resizes dynamically as panels open and close
+- **movable widget** — frameless, transparent, always-on-top; drag the friend
+  anywhere (position persists) or snap it to a corner in config → behavior.
+  Bubbles and panels open toward free screen space and the window is kept
+  fully on-screen as panels open and close
 - **speech bubble** — pops up for a configurable number of seconds when the
   avatar talks (poke, → next, or scheduled nudges); hovering keeps it up
 - **quote learning** — ↑ more / ↓ less weights each line (0 = muted, never
