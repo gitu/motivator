@@ -141,7 +141,15 @@ Configure under **config → api** in the widget, or via environment:
 MOTIVATOR_BASE_URL=https://api.openai.com/v1   # any /v1-compatible server
 MOTIVATOR_API_KEY=sk-...                        # static bearer token ("" for local servers)
 MOTIVATOR_MODEL=gpt-4o-mini
+MOTIVATOR_MAX_TOKENS=200                        # reply length cap
+MOTIVATOR_TOKEN_PARAM=auto                      # auto | max-tokens | max-completion-tokens
 ```
+
+The cap is sent as `max_tokens` by default; if the server rejects it the way
+newer OpenAI models do ("use `max_completion_tokens` instead"), the client
+retries with `max_completion_tokens` automatically and remembers the choice
+for the rest of the run. Pin the parameter name in config → api (or via
+`MOTIVATOR_TOKEN_PARAM`) if auto-detection guesses wrong for your server.
 
 Works with any OpenAI-compatible `/chat/completions` server: OpenAI, a local
 llama.cpp / Ollama (`http://localhost:11434/v1`), vLLM, LiteLLM, etc. The AI

@@ -279,6 +279,48 @@ fn default_gen_count() -> u8 {
     3
 }
 
+/// Which JSON field carries the reply-length cap. Newer OpenAI models reject
+/// `max_tokens` and demand `max_completion_tokens`; many local servers only
+/// know the old name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TokenParam {
+    /// send max_tokens, switch to max_completion_tokens when rejected
+    #[default]
+    Auto,
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl TokenParam {
+    pub const ALL: [TokenParam; 3] = [
+        TokenParam::Auto,
+        TokenParam::MaxTokens,
+        TokenParam::MaxCompletionTokens,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            TokenParam::Auto => "auto",
+            TokenParam::MaxTokens => "max_tokens",
+            TokenParam::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+    pub fn parse(s: &str) -> Option<TokenParam> {
+        match s.trim() {
+            "auto" => Some(TokenParam::Auto),
+            "max-tokens" | "max_tokens" => Some(TokenParam::MaxTokens),
+            "max-completion-tokens" | "max_completion_tokens" => {
+                Some(TokenParam::MaxCompletionTokens)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn default_max_tokens() -> u32 {
+    200
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// OpenAI-compatible base url, e.g. https://api.openai.com/v1
@@ -286,6 +328,11 @@ pub struct ApiConfig {
     /// static bearer token
     pub api_key: String,
     pub model: String,
+    /// reply length cap sent with every request
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub token_param: TokenParam,
 }
 
 impl Default for ApiConfig {
@@ -294,6 +341,8 @@ impl Default for ApiConfig {
             base_url: "https://api.openai.com/v1".into(),
             api_key: String::new(),
             model: "gpt-4o-mini".into(),
+            max_tokens: default_max_tokens(),
+            token_param: TokenParam::Auto,
         }
     }
 }
@@ -491,6 +540,16 @@ impl Config {
         if let Ok(v) = std::env::var("MOTIVATOR_MODEL") {
             cfg.api.model = v;
         }
+        if let Ok(v) = std::env::var("MOTIVATOR_MAX_TOKENS") {
+            if let Ok(n) = v.trim().parse() {
+                cfg.api.max_tokens = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MOTIVATOR_TOKEN_PARAM") {
+            if let Some(p) = TokenParam::parse(&v) {
+                cfg.api.token_param = p;
+            }
+        }
         cfg
     }
 
@@ -521,11 +580,15 @@ mod tests {
 
     #[test]
     fn config_serde_roundtrip() {
-        let cfg = Config {
+        let mut cfg = Config {
             pos: Some((120.5, 640.0)),
             ..Default::default()
         };
+        cfg.api.max_tokens = 512;
+        cfg.api.token_param = TokenParam::MaxCompletionTokens;
         let back = cfg.roundtrip();
+        assert_eq!(back.api.max_tokens, 512);
+        assert_eq!(back.api.token_param, TokenParam::MaxCompletionTokens);
         assert_eq!(back.friends.len(), cfg.friends.len());
         assert_eq!(back.active, "marc");
         assert!(back.prefer_x11);
@@ -627,6 +690,9 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.prefer_x11);
         assert_eq!(cfg.gen_count, 3);
+        // token knobs arrived after this config was written
+        assert_eq!(cfg.api.max_tokens, 200);
+        assert_eq!(cfg.api.token_param, TokenParam::Auto);
         assert_eq!(cfg.pos, None);
         assert!(cfg.friends[0].pool.is_empty());
         assert!(cfg.friends[0].photo.is_none());
