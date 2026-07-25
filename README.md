@@ -7,9 +7,9 @@
 
 ![motivator demo — a corner avatar popping up motivational lines](assets/demo.gif)
 
-*(demo avatar: an AI-generated person — StyleGAN,
-[public domain via Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Woman_1.jpg) —
-run through the widget's own photo pipeline)*
+*(demo avatar: an AI-generated person — StyleGAN2,
+[public domain via Wikimedia Commons](https://commons.wikimedia.org/wiki/File:GAN_Mensch_StyleGAN2.png) —
+cut out and mouth-line-detected fully automatically by the widget's photo pipeline)*
 
 A Rust implementation of the *Motivator Widget* design (claude.ai/design,
 schr.ag design system). A small always-on-top, frameless, transparent widget

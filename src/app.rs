@@ -643,7 +643,9 @@ impl MotivatorApp {
                 let x0 = boxr.center().x - dw / 2.0;
                 let y0 = boxr.max.y - dh + bob;
                 let head_h = split * dh;
-                let flap_px = flap * 0.09 * head_h;
+                // subtle jaw-snap: a wide-open gap reads as "sliced" on tight
+                // face crops, so keep the lift at 5% of head height
+                let flap_px = flap * 0.05 * head_h;
                 let mut mesh = egui::Mesh::with_texture(tex.id());
                 mesh.add_rect_with_uv(
                     Rect::from_min_size(Pos2::new(x0, y0 + flap_px), vec2(dw, head_h)),
