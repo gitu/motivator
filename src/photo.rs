@@ -163,7 +163,7 @@ fn keep_largest_component(px: &mut [u8], w: usize, h: usize) {
 
 /// Estimate the mouth line from the opaque silhouette: top of head → widest
 /// point (ears/hair) → narrowest below it (neck); mouth sits ~80% of the way
-/// from crown to neck. Clamped to [0.3, 0.72] of image height.
+/// from crown to neck. Clamped to [0.3, 0.78] of image height.
 pub fn split_heuristic(img: &RgbaImage) -> Option<f32> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let px = img.as_raw();
@@ -199,8 +199,8 @@ pub fn split_heuristic(img: &RgbaImage) -> Option<f32> {
     if neck_y <= top_y + 4 {
         return None;
     }
-    let split = (top_y as f32 + 0.8 * (neck_y - top_y) as f32) / h as f32;
-    Some(split.clamp(0.3, 0.72))
+    let split = (top_y as f32 + 0.85 * (neck_y - top_y) as f32) / h as f32;
+    Some(split.clamp(0.3, 0.78))
 }
 
 #[cfg(test)]
@@ -246,7 +246,7 @@ mod tests {
         assert!(img.get_pixel(32, 20)[3] > 0, "head must stay opaque");
         assert_eq!(img.get_pixel(8, 3)[3], 0, "floating island must be pruned");
         // mouth ≈ 80% from crown (y=6) to neck minimum → around y≈0.5–0.6 of height
-        assert!((0.3..=0.72).contains(&split), "split={split}");
+        assert!((0.3..=0.78).contains(&split), "split={split}");
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod tests {
         // alpha preserved: corners stay transparent, center stays opaque
         assert_eq!(out.get_pixel(1, 1)[3], 0);
         assert!(out.get_pixel(out.width() / 2, out.height() / 2)[3] > 0);
-        assert!((0.3..=0.72).contains(&p.split), "split={}", p.split);
+        assert!((0.3..=0.78).contains(&p.split), "split={}", p.split);
     }
 
     #[test]
