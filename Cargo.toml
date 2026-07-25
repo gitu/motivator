@@ -1,6 +1,7 @@
 [package]
 name = "motivator"
-version = "0.1.0"
+# Placeholder — release builds get the real version from the git tag (release.yml).
+version = "0.0.0"
 edition = "2021"
 description = "a friend in the corner of your desktop. it says the things they'd actually say."
 license = "MIT"
