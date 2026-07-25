@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,10 @@ use egui::{
 
 use crate::api::{self, ApiEvent};
 use crate::autostart;
-use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc, TokenParam};
+use crate::config::{
+    Accent, Config, Corner, Expansion, Friend, IdleAnim, Photo, PhotoMode, Quote, QuoteSrc,
+    TalkAnim, TokenParam,
+};
 use crate::photo;
 use crate::schedule;
 use crate::share;
@@ -40,6 +44,20 @@ enum Tab {
 struct ChatMsg {
     me: bool,
     t: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum UploadSlot {
+    Base,
+    Talk,
+}
+
+/// GPU-side avatar: one frame for stills, several for animated files,
+/// plus the optional "talking" still for TalkAnim::Swap.
+#[derive(Clone)]
+struct AvatarTex {
+    frames: Vec<(egui::TextureHandle, u32)>,
+    talk: Option<egui::TextureHandle>,
 }
 
 struct Bubble {
@@ -104,6 +122,8 @@ pub struct MotivatorApp {
     gen_busy: bool,
     api_note: String,
     photo_note: String,
+    /// an AI talking-frame request is in flight
+    talk_gen_busy: bool,
     share_note: String,
     /// cached is_enabled() — the entry on disk is the source of truth
     autostart: bool,
@@ -111,15 +131,15 @@ pub struct MotivatorApp {
 
     api_rx: Receiver<ApiEvent>,
     api_tx: Sender<ApiEvent>,
-    photo_rx: Receiver<(String, Result<photo::Processed, String>)>,
-    photo_tx: Sender<(String, Result<photo::Processed, String>)>,
+    photo_rx: Receiver<(String, UploadSlot, Result<photo::Processed, String>)>,
+    photo_tx: Sender<(String, UploadSlot, Result<photo::Processed, String>)>,
     share_rx: Receiver<ShareEvent>,
     share_tx: Sender<ShareEvent>,
     /// kept for the app's lifetime — on X11 clipboard contents vanish when the
     /// owning `Clipboard` is dropped
     clip: Option<arboard::Clipboard>,
 
-    textures: HashMap<String, egui::TextureHandle>,
+    textures: HashMap<String, AvatarTex>,
     /// resolved system theme currently in effect
     theme: egui::Theme,
     /// desktop preference from the portal watcher thread (None = no signal)
@@ -175,6 +195,7 @@ impl MotivatorApp {
             gen_busy: false,
             api_note: String::new(),
             photo_note: String::new(),
+            talk_gen_busy: false,
             share_note: String::new(),
             autostart: autostart::is_enabled(),
             autostart_note: String::new(),
@@ -407,7 +428,10 @@ impl MotivatorApp {
             id: id.clone(),
             name: "new friend".into(),
             photo: None,
-            split: 0.52,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Jaw,
+            idle_anim: IdleAnim::Off,
+            blink: true,
             accent,
             quotes: Vec::new(),
             pool: Vec::new(),
@@ -440,18 +464,56 @@ impl MotivatorApp {
         self.mark_dirty();
     }
 
-    fn upload_photo(&mut self, ctx: &egui::Context) {
+    /// Generate a mouth-open talking still from the current photo via the
+    /// endpoint's image-edits API, then feed it through the normal photo
+    /// pipeline as the swap frame.
+    fn gen_talk_frame(&mut self, ctx: &egui::Context) {
+        if self.talk_gen_busy {
+            return;
+        }
+        let Some(photo) = self.active().photo.clone() else {
+            return;
+        };
+        let api = self.cfg.api.clone();
+        let id = self.active().id.clone();
+        let mode = self.active().photo_mode;
+        let tx = self.photo_tx.clone();
+        let ctx = ctx.clone();
+        self.talk_gen_busy = true;
+        std::thread::spawn(move || {
+            // raw-mode photos may be jpg/webp/gif on disk — the API part is
+            // declared image/png, so normalize first
+            let result = photo::png_bytes_of(&photo.path)
+                .and_then(|png| api::talk_frame(&api, &png))
+                .and_then(|png| {
+                    photo::process_and_store_bytes(&png, Some("png"), &format!("{id}.talk"), mode)
+                });
+            let _ = tx.send((id, UploadSlot::Talk, result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn upload_photo(&mut self, ctx: &egui::Context, slot: UploadSlot) {
         let tx = self.photo_tx.clone();
         let id = self.active().id.clone();
+        let mode = self.active().photo_mode;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let title = match slot {
+                UploadSlot::Base => "pick a photo of them",
+                UploadSlot::Talk => "pick their talking frame (mouth open)",
+            };
             if let Some(path) = rfd::FileDialog::new()
-                .set_title("pick a photo of them")
-                .add_filter("images", &["png", "jpg", "jpeg", "webp"])
+                .set_title(title)
+                .add_filter("images", &["png", "jpg", "jpeg", "webp", "gif"])
                 .pick_file()
             {
-                let result = photo::process_and_store(&path, &id);
-                let _ = tx.send((id, result));
+                let stem = match slot {
+                    UploadSlot::Base => id.clone(),
+                    UploadSlot::Talk => format!("{id}.talk"),
+                };
+                let result = photo::process_and_store(&path, &stem, mode);
+                let _ = tx.send((id, slot, result));
                 ctx.request_repaint();
             }
         });
@@ -639,12 +701,43 @@ impl MotivatorApp {
                 ShareEvent::Import(Err(e)) => self.share_note = e,
             }
         }
-        while let Ok((id, result)) = self.photo_rx.try_recv() {
+        while let Ok((id, slot, result)) = self.photo_rx.try_recv() {
+            if slot == UploadSlot::Talk {
+                self.talk_gen_busy = false;
+            }
             match result {
                 Ok(p) => {
                     if let Some(f) = self.cfg.friends.iter_mut().find(|f| f.id == id) {
-                        f.photo = Some(p.path);
-                        f.split = p.split;
+                        match slot {
+                            UploadSlot::Base => {
+                                // the talking still survives a base re-upload;
+                                // everything else starts fresh from detection
+                                let talk = f.photo.take().and_then(|old| old.talk);
+                                f.photo = Some(Photo {
+                                    path: p.path,
+                                    split: p.face.map_or(0.52, |fc| fc.split),
+                                    split_manual: false,
+                                    eyes: p.face.and_then(|fc| fc.eyes),
+                                    chin: p.face.map(|fc| fc.chin),
+                                    face_x: p.face.map(|fc| fc.face_x),
+                                    talk,
+                                    frame_ms: p.frames.iter().map(|(_, ms)| *ms).collect(),
+                                });
+                                // jaw/flap need a stable mouth line; animated
+                                // frames don't have one
+                                if f.photo.as_ref().is_some_and(|ph| ph.animated())
+                                    && matches!(f.talk_anim, TalkAnim::Jaw | TalkAnim::Flap)
+                                {
+                                    f.talk_anim = TalkAnim::Bounce;
+                                }
+                            }
+                            UploadSlot::Talk => {
+                                if let Some(ph) = &mut f.photo {
+                                    ph.talk = Some(p.path);
+                                    f.talk_anim = TalkAnim::Swap;
+                                }
+                            }
+                        }
                     }
                     self.textures.remove(&id);
                     self.photo_note.clear();
@@ -741,22 +834,56 @@ impl MotivatorApp {
         self.last_sched_check = None;
     }
 
-    fn texture(&mut self, ctx: &egui::Context, friend_idx: usize) -> Option<egui::TextureHandle> {
+    fn avatar_tex(&mut self, ctx: &egui::Context, friend_idx: usize) -> Option<AvatarTex> {
         let f = &self.cfg.friends[friend_idx];
-        let path = f.photo.clone()?;
+        let photo = f.photo.clone()?;
         let id = f.id.clone();
         if let Some(t) = self.textures.get(&id) {
             return Some(t.clone());
         }
-        let img = image::open(&path).ok()?.to_rgba8();
-        let size = [img.width() as usize, img.height() as usize];
-        let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-        let tex = ctx.load_texture(format!("photo-{id}"), color, egui::TextureOptions::LINEAR);
+        let mut frames = Vec::new();
+        if photo.animated() {
+            let dir = photo
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            for (n, &ms) in photo.frame_ms.iter().enumerate() {
+                let p = dir.join(format!("{id}.f{n}.png"));
+                if let Some(t) = load_tex(ctx, &p, format!("photo-{id}-f{n}")) {
+                    frames.push((t, ms.max(20)));
+                }
+            }
+        }
+        if frames.is_empty() {
+            frames.push((load_tex(ctx, &photo.path, format!("photo-{id}"))?, 0));
+        }
+        let talk = photo
+            .talk
+            .and_then(|p| load_tex(ctx, &p, format!("photo-{id}-talk")));
+        let tex = AvatarTex { frames, talk };
         self.textures.insert(id, tex.clone());
         Some(tex)
     }
 
     // ---------------------------------------------------------------- UI --
+
+    /// small pill selector used by the photo/animation option rows
+    fn chip(&self, ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+        let pal = self.pal();
+        let (bg, fg) = if active {
+            (pal.accent, pal.foreground)
+        } else {
+            (pal.card, pal.muted_fg)
+        };
+        let resp = ui.add(
+            egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
+                .fill(bg)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .corner_radius(CornerRadius::same(20)),
+        );
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
 
     fn label_text(&self, s: &str) -> RichText {
         RichText::new(s.to_uppercase())
@@ -827,8 +954,8 @@ impl MotivatorApp {
         let has_photo = f.photo.is_some();
         let (rect, _) = ui.allocate_exact_size(vec2(px, px), Sense::hover());
         if has_photo {
-            if let Some(tex) = self.texture(ctx, idx) {
-                draw_contain_bottom(ui.painter(), &tex, rect, 1.0);
+            if let Some(av) = self.avatar_tex(ctx, idx) {
+                draw_contain_bottom(ui.painter(), &av.frames[0].0, rect, 1.0);
                 return;
             }
         }
@@ -858,7 +985,20 @@ impl MotivatorApp {
         let accent = pal.accent_color(f.accent);
         let nudges = f.nudges;
         let has_photo = f.photo.is_some();
-        let split = f.split.clamp(0.1, 0.9);
+        let split = f.photo.as_ref().map_or(0.52, |p| p.split).clamp(0.1, 0.9);
+        let talk_anim = f.talk_anim;
+        let idle_anim = f.idle_anim;
+        let animated = f.photo.as_ref().is_some_and(Photo::animated);
+        let eyes = if f.blink {
+            f.photo.as_ref().and_then(|p| p.eyes)
+        } else {
+            None
+        };
+        let face_x = f
+            .photo
+            .as_ref()
+            .and_then(|p| p.face_x)
+            .unwrap_or((0.2, 0.8));
         let letter = f
             .name
             .trim()
@@ -895,21 +1035,80 @@ impl MotivatorApp {
         let rounding = CornerRadius::same((px * 0.22) as u8);
 
         // talking animation offsets
-        let (mut bob, mut flap) = (0.0f32, 0.0f32);
+        let (mut bob, mut flap, mut jaw, mut shimmy, mut swap_frame) =
+            (0.0f32, 0.0f32, 0.0f32, 0.0f32, false);
         if let Some(start) = self.speak_start {
             let t = Instant::now().duration_since(start).as_secs_f32();
             if t < SPEAK_SECS {
-                bob = -2.0 * (std::f32::consts::PI * (t / 0.85).fract()).sin();
-                if t < 0.27 * 6.0 {
-                    flap = -((std::f32::consts::PI * (t / 0.27).fract()).sin());
+                let cadence = (std::f32::consts::PI * (t / 0.27).fract()).sin();
+                match talk_anim {
+                    TalkAnim::Jaw => {
+                        jaw = jaw_open(t);
+                        bob = -1.5 * (std::f32::consts::PI * (t / 0.85).fract()).sin();
+                    }
+                    TalkAnim::Flap => {
+                        bob = -2.0 * (std::f32::consts::PI * (t / 0.85).fract()).sin();
+                        if t < 0.27 * 6.0 {
+                            flap = -cadence;
+                        }
+                    }
+                    TalkAnim::Bounce => bob = -3.0 * cadence.abs(),
+                    TalkAnim::Sway => {
+                        shimmy = 2.0 * (std::f32::consts::TAU * (t / 0.54).fract()).sin()
+                    }
+                    TalkAnim::Swap => swap_frame = (t / 0.27) as i32 % 2 == 1,
+                    TalkAnim::None => {}
                 }
                 ui.ctx().request_repaint();
             }
         }
 
+        // idle animation offsets — continuous, so they get their own repaints
+        let (mut idle_dx, mut idle_dy, mut breathe) = (0.0f32, 0.0f32, 0.0f32);
+        if has_photo && idle_anim != IdleAnim::Off {
+            let now = ui.input(|i| i.time) as f32;
+            let tau = std::f32::consts::TAU;
+            if matches!(idle_anim, IdleAnim::Breathe | IdleAnim::Alive) {
+                breathe = 0.015 * (now * tau / 2.4).sin();
+            }
+            if matches!(idle_anim, IdleAnim::Sway | IdleAnim::Alive) {
+                idle_dx = 1.5 * (now * tau / 3.1).sin();
+            }
+            if idle_anim == IdleAnim::Alive {
+                // a brief micro-bob every ~7 s
+                let phase = (now / 7.0).fract();
+                if phase < 0.08 {
+                    idle_dy = -2.0 * (std::f32::consts::PI * phase / 0.08).sin();
+                }
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+
         let painter = ui.painter();
         if has_photo {
-            if let Some(tex) = self.texture(ctx, idx) {
+            if let Some(av) = self.avatar_tex(ctx, idx) {
+                // current frame: wall-clock loop over the per-frame delays
+                let mut tex = &av.frames[0].0;
+                if av.frames.len() > 1 {
+                    let total: u32 = av.frames.iter().map(|(_, ms)| *ms).sum::<u32>().max(1);
+                    let now_ms = (ui.input(|i| i.time) * 1000.0) as u32 % total;
+                    let mut acc = 0u32;
+                    for (t, ms) in &av.frames {
+                        acc += ms;
+                        if now_ms < acc {
+                            tex = t;
+                            ui.ctx().request_repaint_after(Duration::from_millis(
+                                (acc - now_ms) as u64,
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if swap_frame {
+                    if let Some(t) = &av.talk {
+                        tex = t;
+                    }
+                }
                 let boxr = Rect::from_min_max(
                     Pos2::new(tile.min.x - 0.10 * px, tile.min.y - 0.32 * px),
                     tile.max,
@@ -917,25 +1116,103 @@ impl MotivatorApp {
                 let ts = tex.size_vec2();
                 let scale = (boxr.width() / ts.x).min(boxr.height() / ts.y);
                 let dw = ts.x * scale;
-                let dh = ts.y * scale;
-                let x0 = boxr.center().x - dw / 2.0;
-                let y0 = boxr.max.y - dh + bob;
-                let head_h = split * dh;
-                // subtle jaw-snap: a wide-open gap reads as "sliced" on tight
-                // face crops, so keep the lift at 5% of head height
-                let flap_px = flap * 0.05 * head_h;
+                // breathing stretches the sprite from its bottom anchor
+                let dh = ts.y * scale * (1.0 + breathe);
+                let x0 = boxr.center().x - dw / 2.0 + idle_dx + shimmy;
+                let y0 = boxr.max.y - dh + bob + idle_dy;
                 let mut mesh = egui::Mesh::with_texture(tex.id());
-                mesh.add_rect_with_uv(
-                    Rect::from_min_size(Pos2::new(x0, y0 + flap_px), vec2(dw, head_h)),
-                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, split)),
-                    Color32::WHITE,
-                );
-                mesh.add_rect_with_uv(
-                    Rect::from_min_size(Pos2::new(x0, y0 + head_h), vec2(dw, dh - head_h)),
-                    Rect::from_min_max(Pos2::new(0.0, split), Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                // vertical offset of the head slice — the blink overlay has
+                // to ride along with whatever the talking warp does
+                let mut head_off = 0.0f32;
+                if talk_anim == TalkAnim::Jaw && !animated {
+                    // mouth-warp: the head above the lip lifts and the
+                    // opening is filled with the stretched lip band, so the
+                    // mouth visibly opens instead of showing a slice gap
+                    let head_h = split * dh;
+                    let open_px = jaw * 0.055 * head_h;
+                    head_off = -open_px;
+                    let y_lip = y0 + head_h;
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y_lip), vec2(dw, dh - head_h)),
+                        Rect::from_min_max(Pos2::new(0.0, split), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    if open_px > 0.05 {
+                        // lip pixels stretched into the gap; transparent
+                        // image edges stay transparent, so no bookkeeping
+                        mesh.add_rect_with_uv(
+                            Rect::from_min_max(
+                                Pos2::new(x0, y_lip - open_px),
+                                Pos2::new(x0 + dw, y_lip),
+                            ),
+                            Rect::from_min_max(
+                                Pos2::new(0.0, split - 0.006),
+                                Pos2::new(1.0, split + 0.006),
+                            ),
+                            Color32::WHITE,
+                        );
+                    }
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y0 - open_px), vec2(dw, head_h)),
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, split)),
+                        Color32::WHITE,
+                    );
+                } else if talk_anim == TalkAnim::Flap && !animated {
+                    let head_h = split * dh;
+                    // subtle jaw-snap: a wide-open gap reads as "sliced" on tight
+                    // face crops, so keep the lift at 5% of head height
+                    let flap_px = flap * 0.05 * head_h;
+                    head_off = flap_px;
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y0 + flap_px), vec2(dw, head_h)),
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, split)),
+                        Color32::WHITE,
+                    );
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y0 + head_h), vec2(dw, dh - head_h)),
+                        Rect::from_min_max(Pos2::new(0.0, split), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    mesh.add_rect_with_uv(
+                        Rect::from_min_size(Pos2::new(x0, y0), vec2(dw, dh)),
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
                 ui.painter().add(egui::Shape::mesh(mesh));
+
+                // blink: draw the eyelid strip (the band just above the
+                // eyes) squashed over the eye band; partial closure animates
+                // the lid coming down
+                if let Some((ey, eh)) = eyes {
+                    if !animated && !swap_frame {
+                        let now = ui.input(|i| i.time);
+                        let lid = blink_amount(now);
+                        if lid > 0.0 {
+                            let (fx0, fx1) = face_x;
+                            let eye_top = y0 + (ey - eh * 0.5) * dh + head_off;
+                            let mut lids = egui::Mesh::with_texture(tex.id());
+                            lids.add_rect_with_uv(
+                                Rect::from_min_max(
+                                    Pos2::new(x0 + fx0 * dw, eye_top),
+                                    Pos2::new(x0 + fx1 * dw, eye_top + lid * eh * dh),
+                                ),
+                                Rect::from_min_max(
+                                    Pos2::new(fx0, ey - 1.3 * eh),
+                                    Pos2::new(fx1, ey - 0.3 * eh),
+                                ),
+                                Color32::WHITE,
+                            );
+                            ui.painter().add(egui::Shape::mesh(lids));
+                            ui.ctx().request_repaint();
+                        } else {
+                            ui.ctx().request_repaint_after(Duration::from_secs_f64(
+                                next_blink_in(now).max(0.05),
+                            ));
+                        }
+                    }
+                }
             }
         } else {
             // letter tile — the dark ground stays dark in both themes, like the design
@@ -1468,7 +1745,7 @@ impl MotivatorApp {
                     ))
                     .clicked()
                 {
-                    self.upload_photo(ctx);
+                    self.upload_photo(ctx, UploadSlot::Base);
                 }
                 let has_photo = self.active().photo.is_some();
                 if has_photo && self.tiny_button(ui, "use letter instead").clicked() {
@@ -1485,6 +1762,128 @@ impl MotivatorApp {
                     .font(theme::font_label())
                     .color(pal.destructive),
             );
+        }
+        ui.label(self.label_text("photo processing (next upload)"));
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            let current = self.active().photo_mode;
+            let mut pick = None;
+            for m in PhotoMode::ALL {
+                if self.chip(ui, m.label(), m == current).clicked() {
+                    pick = Some(m);
+                }
+            }
+            if let Some(m) = pick {
+                if m != current {
+                    self.active_mut().photo_mode = m;
+                }
+            }
+        });
+        let has_photo = self.active().photo.is_some();
+        if has_photo {
+            let photo = self.active().photo.as_ref().unwrap();
+            let (has_talk, animated, mut split) =
+                (photo.talk.is_some(), photo.animated(), photo.split);
+            ui.horizontal(|ui| {
+                let label = if has_talk {
+                    "replace talking frame"
+                } else {
+                    "+ talking frame (mouth open)"
+                };
+                if self.tiny_button(ui, label).clicked() {
+                    self.upload_photo(ctx, UploadSlot::Talk);
+                }
+                if api::configured(&self.cfg.api) {
+                    let ai_label = if self.talk_gen_busy {
+                        "generating…"
+                    } else {
+                        "✨ generate with ai"
+                    };
+                    if self.tiny_button(ui, ai_label).clicked() && !self.talk_gen_busy {
+                        self.gen_talk_frame(ctx);
+                    }
+                }
+                if has_talk && self.tiny_button(ui, "×").clicked() {
+                    let id = self.active().id.clone();
+                    let f = self.active_mut();
+                    if let Some(ph) = &mut f.photo {
+                        ph.talk = None;
+                    }
+                    if f.talk_anim == TalkAnim::Swap {
+                        f.talk_anim = if animated {
+                            TalkAnim::Bounce
+                        } else {
+                            TalkAnim::Flap
+                        };
+                    }
+                    self.textures.remove(&id);
+                }
+            });
+            if !animated && matches!(self.active().talk_anim, TalkAnim::Jaw | TalkAnim::Flap) {
+                let label = self.label_text("mouth line");
+                if ui
+                    .add(egui::Slider::new(&mut split, 0.10..=0.90).text(label))
+                    .changed()
+                {
+                    if let Some(ph) = &mut self.active_mut().photo {
+                        ph.split = split;
+                        ph.split_manual = true;
+                    }
+                }
+            }
+            ui.label(self.label_text("talking"));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                let current = self.active().talk_anim;
+                let mut pick = None;
+                for a in TalkAnim::ALL {
+                    let enabled = match a {
+                        TalkAnim::Jaw | TalkAnim::Flap => !animated,
+                        TalkAnim::Swap => has_talk,
+                        _ => true,
+                    };
+                    let clicked = ui
+                        .add_enabled_ui(enabled, |ui| self.chip(ui, a.label(), a == current))
+                        .inner
+                        .clicked();
+                    if clicked && enabled {
+                        pick = Some(a);
+                    }
+                }
+                if let Some(a) = pick {
+                    self.active_mut().talk_anim = a;
+                }
+            });
+            ui.label(self.label_text("idle"));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                let current = self.active().idle_anim;
+                let mut pick = None;
+                for a in IdleAnim::ALL {
+                    if self.chip(ui, a.label(), a == current).clicked() {
+                        pick = Some(a);
+                    }
+                }
+                if let Some(a) = pick {
+                    self.active_mut().idle_anim = a;
+                }
+            });
+            // blinking needs a detected eye band — hide the toggle otherwise
+            if !animated
+                && self
+                    .active()
+                    .photo
+                    .as_ref()
+                    .is_some_and(|p| p.eyes.is_some())
+            {
+                let mut blink = self.active().blink;
+                if ui
+                    .checkbox(&mut blink, RichText::new("blink").font(theme::font_ui()))
+                    .changed()
+                {
+                    self.active_mut().blink = blink;
+                }
+            }
         }
         ui.label(
             RichText::new("name")
@@ -2271,6 +2670,57 @@ fn hline(ui: &mut egui::Ui, pal: &Palette, w: f32) {
     );
 }
 
+/// Mouth-open amount (0..=1) for the jaw warp, `t` seconds into speaking:
+/// two incommensurate sines so syllables never settle into a metronome,
+/// clamped to open-only — a mouth can't close past closed.
+fn jaw_open(t: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    (0.55 * (tau * t / 0.31).sin() + 0.45 * (tau * t / 0.21).sin()).clamp(0.0, 1.0)
+}
+
+/// blink cycle length / lid travel time in seconds
+const BLINK_PERIOD: f64 = 3.7;
+const BLINK_SECS: f32 = 0.14;
+
+/// Eyelid closure (0 open ..= 1 shut) at wall-clock time `t`: one ~140 ms
+/// blink every cycle, plus a quick double blink every fourth cycle so it
+/// doesn't read as a metronome.
+fn blink_amount(t: f64) -> f32 {
+    let cycle = (t / BLINK_PERIOD) as u64;
+    let ph = (t % BLINK_PERIOD) as f32;
+    let lid = |start: f32| {
+        let x = (ph - start) / BLINK_SECS;
+        if (0.0..1.0).contains(&x) {
+            (std::f32::consts::PI * x).sin()
+        } else {
+            0.0
+        }
+    };
+    let mut a = lid(0.0);
+    if cycle % 4 == 1 {
+        a = a.max(lid(0.35));
+    }
+    a
+}
+
+/// Seconds until the next blink starts — how long the repaint can sleep.
+fn next_blink_in(t: f64) -> f64 {
+    let cycle = (t / BLINK_PERIOD) as u64;
+    let ph = t % BLINK_PERIOD;
+    if cycle % 4 == 1 && ph < 0.35 {
+        0.35 - ph
+    } else {
+        BLINK_PERIOD - ph
+    }
+}
+
+fn load_tex(ctx: &egui::Context, path: &Path, name: String) -> Option<egui::TextureHandle> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
+}
+
 fn draw_contain_bottom(
     painter: &egui::Painter,
     tex: &egui::TextureHandle,
@@ -2362,7 +2812,10 @@ mod tests {
             id: "t".into(),
             name: "t".into(),
             photo: None,
-            split: 0.52,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Flap,
+            idle_anim: IdleAnim::Off,
+            blink: true,
             accent: Accent::Orange,
             quotes: vec![
                 Quote {
@@ -2448,6 +2901,33 @@ mod tests {
         }
         assert_eq!(quotes[0].w, 5, "weight clamps at 5");
         assert!(!adjust_weight(&mut quotes, "unknown line", -1));
+    }
+
+    #[test]
+    fn jaw_open_stays_in_range_and_actually_opens() {
+        let mut opened = false;
+        for i in 0..200 {
+            let v = jaw_open(i as f32 * 0.01);
+            assert!((0.0..=1.0).contains(&v), "t={i} v={v}");
+            if v > 0.5 {
+                opened = true;
+            }
+        }
+        assert!(opened, "the mouth must open during ~2s of talking");
+        assert_eq!(jaw_open(0.0), 0.0, "starts closed");
+    }
+
+    #[test]
+    fn blink_fires_on_schedule_and_sleeps_between() {
+        // eyes shut mid-blink at each cycle start…
+        assert!(blink_amount(BLINK_PERIOD + 0.07) > 0.9);
+        // …open between blinks…
+        assert_eq!(blink_amount(1.5), 0.0);
+        // …and the double blink lands on cycle 1 (cycle % 4 == 1)
+        assert!(blink_amount(BLINK_PERIOD + 0.35 + 0.07) > 0.9);
+        // wake-up points: the second blink of a double cycle, else next cycle
+        assert!((next_blink_in(BLINK_PERIOD + 0.2) - 0.15).abs() < 1e-6);
+        assert!((next_blink_in(1.0) - (BLINK_PERIOD - 1.0)).abs() < 1e-6);
     }
 
     #[test]

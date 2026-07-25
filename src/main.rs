@@ -10,16 +10,58 @@ mod share;
 mod theme;
 
 fn main() -> eframe::Result {
-    // `motivator --cutout <image> <friend-id>` runs the photo pipeline and
-    // exits — useful for scripting/debugging avatar cut-outs
+    // `motivator --cutout <image> <friend-id> [auto|precut|raw]` runs the
+    // photo pipeline and exits — useful for scripting/debugging avatar
+    // cut-outs
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|a| a == "--cutout") {
-        let (src, id) = (
-            args.get(2).expect("usage: --cutout <image> <friend-id>"),
-            args.get(3).expect("usage: --cutout <image> <friend-id>"),
-        );
-        match photo::process_and_store(std::path::Path::new(src), id) {
-            Ok(p) => println!("ok {} split={:.3}", p.path.display(), p.split),
+        let usage = "usage: --cutout <image> <friend-id> [auto|precut|raw]";
+        let (src, id) = (args.get(2).expect(usage), args.get(3).expect(usage));
+        let mode = match args.get(4).map(String::as_str) {
+            None | Some("auto") => config::PhotoMode::Auto,
+            Some("precut") => config::PhotoMode::Precut,
+            Some("raw") => config::PhotoMode::Raw,
+            Some(_) => panic!("{usage}"),
+        };
+        match photo::process_and_store(std::path::Path::new(src), id, mode) {
+            Ok(p) => {
+                let face = p.face.map_or("face=none".to_string(), |f| {
+                    format!(
+                        "split={:.3} chin={:.3} eyes={}",
+                        f.split,
+                        f.chin,
+                        f.eyes
+                            .map_or("none".to_string(), |(y, h)| format!("{y:.3}h{h:.3}"))
+                    )
+                });
+                println!("ok {} {face} frames={}", p.path.display(), p.frames.len());
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    // `motivator --talkframe <cutout.png> <friend-id>` asks the configured
+    // image API for a mouth-open frame and stores it as {id}.talk — the
+    // headless twin of the "✨ generate with ai" button
+    if args.get(1).is_some_and(|a| a == "--talkframe") {
+        let usage = "usage: --talkframe <cutout.png> <friend-id>";
+        let (src, id) = (args.get(2).expect(usage), args.get(3).expect(usage));
+        let cfg = config::Config::load();
+        let result = photo::png_bytes_of(std::path::Path::new(src))
+            .and_then(|png| api::talk_frame(&cfg.api, &png))
+            .and_then(|png| {
+                photo::process_and_store_bytes(
+                    &png,
+                    Some("png"),
+                    &format!("{id}.talk"),
+                    config::PhotoMode::Auto,
+                )
+            });
+        match result {
+            Ok(p) => println!("ok {}", p.path.display()),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);

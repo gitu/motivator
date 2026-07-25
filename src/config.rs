@@ -58,6 +58,100 @@ impl Accent {
     ];
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PhotoMode {
+    /// flood-fill cut-out + face detection (the original pipeline)
+    #[default]
+    Auto,
+    /// trust the image's own alpha channel; still resize + detect the mouth
+    Precut,
+    /// store the file untouched: no resize, no cut-out, no detection
+    /// (animated files are still decoded into bounded frames so they can
+    /// become textures)
+    Raw,
+}
+
+impl PhotoMode {
+    pub const ALL: [PhotoMode; 3] = [PhotoMode::Auto, PhotoMode::Precut, PhotoMode::Raw];
+    pub fn label(self) -> &'static str {
+        match self {
+            PhotoMode::Auto => "auto cut-out",
+            PhotoMode::Precut => "already cut out",
+            PhotoMode::Raw => "keep as-is",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TalkAnim {
+    /// mouth-warp: the jaw drops and the opening fills with stretched lip
+    /// pixels — the closest to actually talking
+    #[default]
+    Jaw,
+    /// jaw-snap: the head above the mouth line lifts, leaving a visible slice
+    Flap,
+    /// the whole avatar bounces on syllable cadence
+    Bounce,
+    /// quick left/right shimmy
+    Sway,
+    /// alternate with the "talking" still (photo.talk)
+    Swap,
+    None,
+}
+
+impl TalkAnim {
+    pub const ALL: [TalkAnim; 6] = [
+        TalkAnim::Jaw,
+        TalkAnim::Flap,
+        TalkAnim::Bounce,
+        TalkAnim::Sway,
+        TalkAnim::Swap,
+        TalkAnim::None,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            TalkAnim::Jaw => "jaw",
+            TalkAnim::Flap => "flap",
+            TalkAnim::Bounce => "bounce",
+            TalkAnim::Sway => "sway",
+            TalkAnim::Swap => "swap",
+            TalkAnim::None => "none",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleAnim {
+    #[default]
+    Off,
+    /// slow vertical squash-and-stretch
+    Breathe,
+    /// gentle continuous lateral drift
+    Sway,
+    /// breathe + sway + an occasional micro-bob
+    Alive,
+}
+
+impl IdleAnim {
+    pub const ALL: [IdleAnim; 4] = [
+        IdleAnim::Off,
+        IdleAnim::Breathe,
+        IdleAnim::Sway,
+        IdleAnim::Alive,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            IdleAnim::Off => "off",
+            IdleAnim::Breathe => "breathe",
+            IdleAnim::Sway => "sway",
+            IdleAnim::Alive => "alive",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuoteSrc {
@@ -109,15 +203,66 @@ impl Quote {
     }
 }
 
+/// A friend's processed photo and everything that hangs off it — removing
+/// the photo drops the mouth line, talking still, and animation frames with
+/// it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Photo {
+    /// processed image on disk (cut-out PNG, raw copy, or frame 0)
+    pub path: PathBuf,
+    /// mouth line as a fraction of image height — the talking flap splits here
+    pub split: f32,
+    /// the user moved the mouth-line slider — auto-detection must not overwrite
+    pub split_manual: bool,
+    /// eye band (center y, height) as fractions — enables blinking
+    #[serde(default)]
+    pub eyes: Option<(f32, f32)>,
+    /// bottom of the jaw as a fraction — the mouth-warp slice ends here
+    #[serde(default)]
+    pub chin: Option<f32>,
+    /// horizontal face extent as fractions — bounds the blink overlay
+    #[serde(default)]
+    pub face_x: Option<(f32, f32)>,
+    /// second still shown while talking (talk_anim == swap)
+    pub talk: Option<PathBuf>,
+    /// per-frame delays (ms) of an animated avatar; empty = still photo.
+    /// frame files live next to `path` as photos/{id}.f{n}.png
+    pub frame_ms: Vec<u32>,
+}
+
+impl Photo {
+    pub fn still(path: PathBuf, split: f32) -> Self {
+        Photo {
+            path,
+            split,
+            split_manual: false,
+            eyes: None,
+            chin: None,
+            face_x: None,
+            talk: None,
+            frame_ms: Vec::new(),
+        }
+    }
+    pub fn animated(&self) -> bool {
+        !self.frame_ms.is_empty()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Friend {
     pub id: String,
     pub name: String,
-    /// processed cut-out PNG on disk (RGBA, background removed)
-    pub photo: Option<PathBuf>,
-    /// mouth line as a fraction of image height — the talking flap splits here
-    #[serde(default = "default_split")]
-    pub split: f32,
+    pub photo: Option<Photo>,
+    /// how the next photo upload is processed
+    #[serde(default)]
+    pub photo_mode: PhotoMode,
+    #[serde(default)]
+    pub talk_anim: TalkAnim,
+    #[serde(default)]
+    pub idle_anim: IdleAnim,
+    /// blink now and then — needs a photo with a detected eye band
+    #[serde(default = "default_true")]
+    pub blink: bool,
     pub accent: Accent,
     pub quotes: Vec<Quote>,
     /// canned fallback lines used by "remix" expansion when no AI is configured
@@ -126,10 +271,6 @@ pub struct Friend {
     pub expansion: Expansion,
     pub nudges: bool,
     pub interval_secs: u64,
-}
-
-fn default_split() -> f32 {
-    0.52
 }
 
 fn default_true() -> bool {
@@ -295,7 +436,10 @@ fn default_friends() -> Vec<Friend> {
             id: "marc".into(),
             name: "marc".into(),
             photo: None,
-            split: 0.52,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Jaw,
+            idle_anim: IdleAnim::Off,
+            blink: true,
             accent: Accent::Orange,
             quotes: vec![
                 Quote::sample("Do your fucking job."),
@@ -315,7 +459,10 @@ fn default_friends() -> Vec<Friend> {
             id: "ana".into(),
             name: "ana".into(),
             photo: None,
-            split: 0.52,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Jaw,
+            idle_anim: IdleAnim::Off,
+            blink: true,
             accent: Accent::Lime,
             quotes: vec![
                 Quote::sample("you've got this — one thing at a time."),
@@ -334,7 +481,10 @@ fn default_friends() -> Vec<Friend> {
             id: "coach".into(),
             name: "coach k".into(),
             photo: None,
-            split: 0.52,
+            photo_mode: PhotoMode::Auto,
+            talk_anim: TalkAnim::Jaw,
+            idle_anim: IdleAnim::Off,
+            blink: true,
             accent: Accent::Violet,
             quotes: vec![
                 Quote::sample("five more minutes of focus."),
@@ -447,6 +597,10 @@ mod tests {
         assert_eq!(back.pos, Some((120.5, 640.0)));
         assert_eq!(back.friends[0].quotes.len(), 4);
         assert!(matches!(back.friends[0].expansion, Expansion::Remix));
+        assert_eq!(back.friends[0].photo_mode, PhotoMode::Auto);
+        assert_eq!(back.friends[0].talk_anim, TalkAnim::Jaw);
+        assert_eq!(back.friends[0].idle_anim, IdleAnim::Off);
+        assert!(back.friends[0].photo.is_none());
         assert_eq!(back.schedule.len(), 3);
         assert_eq!(back.schedule, cfg.schedule);
         assert!(!back.schedule_enabled, "schedule ships switched off");
@@ -486,9 +640,44 @@ mod tests {
     }
 
     #[test]
-    fn old_config_without_new_fields_still_loads() {
-        // simulates a config written before prefer_x11 / split / pool existed
-        // (and after theme was still a config field — now ignored)
+    fn photo_and_anim_options_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.friends[0].photo_mode = PhotoMode::Raw;
+        cfg.friends[0].talk_anim = TalkAnim::Swap;
+        cfg.friends[0].idle_anim = IdleAnim::Alive;
+        cfg.friends[0].photo = Some(Photo {
+            path: PathBuf::from("/tmp/x.png"),
+            split: 0.6,
+            split_manual: true,
+            eyes: Some((0.41, 0.09)),
+            chin: Some(0.74),
+            face_x: Some((0.22, 0.81)),
+            talk: Some(PathBuf::from("/tmp/x.talk.png")),
+            frame_ms: vec![40, 60, 40],
+        });
+        let back = cfg.roundtrip();
+        assert_eq!(back.friends[0].photo_mode, PhotoMode::Raw);
+        assert_eq!(back.friends[0].talk_anim, TalkAnim::Swap);
+        assert_eq!(back.friends[0].idle_anim, IdleAnim::Alive);
+        let photo = back.friends[0].photo.as_ref().unwrap();
+        assert_eq!(photo.split, 0.6);
+        assert!(photo.split_manual);
+        assert_eq!(photo.eyes, Some((0.41, 0.09)));
+        assert_eq!(photo.chin, Some(0.74));
+        assert_eq!(photo.face_x, Some((0.22, 0.81)));
+        assert_eq!(
+            photo.talk.as_deref(),
+            Some(std::path::Path::new("/tmp/x.talk.png"))
+        );
+        assert_eq!(photo.frame_ms, vec![40, 60, 40]);
+        assert!(photo.animated());
+    }
+
+    #[test]
+    fn partial_config_fills_in_defaults() {
+        // optional fields (pool, pos, schedule, photo/animation options,
+        // unknown leftovers like "theme") may be missing or extra — the rest
+        // of the config still loads and the gaps get defaults
         let json = r#"{
             "corner": "bottom-right", "avatar_size": 68.0, "bubble_secs": 8.0,
             "theme": "dark",
@@ -507,10 +696,14 @@ mod tests {
         assert_eq!(cfg.api.max_tokens, 200);
         assert_eq!(cfg.api.token_param, TokenParam::Auto);
         assert_eq!(cfg.pos, None);
-        assert_eq!(cfg.friends[0].split, 0.52);
         assert!(cfg.friends[0].pool.is_empty());
-        // schedule arrived later still: existing configs keep an empty
-        // schedule (no surprise example windows), and it stays off
+        assert!(cfg.friends[0].photo.is_none());
+        assert_eq!(cfg.friends[0].photo_mode, PhotoMode::Auto);
+        assert_eq!(cfg.friends[0].talk_anim, TalkAnim::Jaw);
+        assert_eq!(cfg.friends[0].idle_anim, IdleAnim::Off);
+        assert!(cfg.friends[0].blink);
+        // a config that never had a schedule keeps an empty one (no surprise
+        // example windows), and it stays off
         assert!(cfg.schedule.is_empty());
         assert!(!cfg.schedule_enabled);
     }
