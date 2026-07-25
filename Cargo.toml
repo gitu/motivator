@@ -17,6 +17,7 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 ureq = { version = "3", features = ["json"] }
 rfd = "0.17"
+arboard = "3"
 fastrand = "2"
 rustface = "0.1.7"
 
