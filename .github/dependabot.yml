@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Rust dependencies (Cargo manifest at repo root)
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:00'
+    open-pull-requests-limit: 10
+    groups:
+      # One PR for routine minor/patch bumps to keep the noise down; majors
+      # still come as individual PRs so they get a proper look.
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the CI / release / CodeQL workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:00'
+    groups:
+      actions:
+        patterns:
+          - '*'

@@ -152,27 +152,8 @@ impl MotivatorApp {
     fn pick_quote(&self) -> Option<(String, &'static str)> {
         let f = self.active();
         let pool = Self::rotation(f);
-        if pool.is_empty() {
-            return None;
-        }
         let current = self.bubble.as_ref().map(|b| b.text.as_str());
-        let mut cand: Vec<&&Quote> = pool
-            .iter()
-            .filter(|q| Some(q.t.as_str()) != current)
-            .collect();
-        if cand.is_empty() {
-            cand = pool.iter().collect();
-        }
-        let total: u32 = cand.iter().map(|q| q.w as u32).sum();
-        let mut r = fastrand::u32(0..total.max(1));
-        for q in &cand {
-            let w = q.w as u32;
-            if r < w {
-                return Some((q.t.clone(), q.src.tag()));
-            }
-            r -= w;
-        }
-        cand.first().map(|q| (q.t.clone(), q.src.tag()))
+        pick_from(&pool, current).map(|q| (q.t.clone(), q.src.tag()))
     }
 
     fn speak(&mut self) {
@@ -194,16 +175,7 @@ impl MotivatorApp {
         let Some(text) = self.bubble.as_ref().map(|b| b.text.clone()) else {
             return;
         };
-        let mut muted = false;
-        {
-            let f = self.active_mut();
-            for q in &mut f.quotes {
-                if q.t == text {
-                    q.w = (q.w as i32 + dir).clamp(0, 5) as u8;
-                    muted = q.w == 0;
-                }
-            }
-        }
+        let muted = adjust_weight(&mut self.active_mut().quotes, &text, dir);
         let note = if dir > 0 {
             "noted ↑ more like this"
         } else if muted {
@@ -1529,6 +1501,45 @@ const INTERVALS: [(u64, &str); 4] = [
     (7200, "every 2 hours"),
 ];
 
+/// Weighted random pick from the rotation, avoiding an immediate repeat of
+/// `current` unless it is the only line left.
+fn pick_from<'a>(pool: &[&'a Quote], current: Option<&str>) -> Option<&'a Quote> {
+    if pool.is_empty() {
+        return None;
+    }
+    let mut cand: Vec<&'a Quote> = pool
+        .iter()
+        .copied()
+        .filter(|q| Some(q.t.as_str()) != current)
+        .collect();
+    if cand.is_empty() {
+        cand = pool.to_vec();
+    }
+    let total: u32 = cand.iter().map(|q| q.w as u32).sum();
+    let mut r = fastrand::u32(0..total.max(1));
+    for q in &cand {
+        let w = q.w as u32;
+        if r < w {
+            return Some(q);
+        }
+        r -= w;
+    }
+    cand.first().copied()
+}
+
+/// Bump the weight of every quote matching `text` by `dir`, clamped to 0..=5.
+/// Returns true when the line ended up muted (weight 0).
+fn adjust_weight(quotes: &mut [Quote], text: &str, dir: i32) -> bool {
+    let mut muted = false;
+    for q in quotes {
+        if q.t == text {
+            q.w = (q.w as i32 + dir).clamp(0, 5) as u8;
+            muted = q.w == 0;
+        }
+    }
+    muted
+}
+
 fn interval_label(secs: u64) -> String {
     INTERVALS
         .iter()
@@ -1624,5 +1635,97 @@ impl eframe::App for MotivatorApp {
         } else {
             Duration::from_millis(100)
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn friend(expansion: Expansion) -> Friend {
+        Friend {
+            id: "t".into(),
+            name: "t".into(),
+            photo: None,
+            split: 0.52,
+            accent: Accent::Orange,
+            quotes: vec![
+                Quote {
+                    t: "s1".into(),
+                    src: QuoteSrc::Sample,
+                    w: 1,
+                },
+                Quote {
+                    t: "a1".into(),
+                    src: QuoteSrc::Auto,
+                    w: 1,
+                },
+                Quote {
+                    t: "muted".into(),
+                    src: QuoteSrc::Sample,
+                    w: 0,
+                },
+                Quote {
+                    t: "ai1".into(),
+                    src: QuoteSrc::New,
+                    w: 3,
+                },
+            ],
+            pool: vec![],
+            expansion,
+            nudges: false,
+            interval_secs: 60,
+        }
+    }
+
+    fn titles(pool: &[&Quote]) -> Vec<String> {
+        pool.iter().map(|q| q.t.clone()).collect()
+    }
+
+    #[test]
+    fn rotation_respects_weights_and_expansion() {
+        // expansion off: only unmuted sample lines rotate
+        let f = friend(Expansion::Off);
+        assert_eq!(titles(&MotivatorApp::rotation(&f)), ["s1"]);
+        // remix/ai: auto + ai lines join, muted (w=0) lines never do
+        let f = friend(Expansion::Remix);
+        assert_eq!(titles(&MotivatorApp::rotation(&f)), ["s1", "a1", "ai1"]);
+    }
+
+    #[test]
+    fn pick_avoids_immediate_repeat() {
+        let f = friend(Expansion::Remix);
+        let pool = MotivatorApp::rotation(&f);
+        for seed in 0..50 {
+            fastrand::seed(seed);
+            let q = pick_from(&pool, Some("ai1")).unwrap();
+            assert_ne!(q.t, "ai1");
+        }
+    }
+
+    #[test]
+    fn pick_falls_back_when_current_is_the_only_line() {
+        let f = friend(Expansion::Off);
+        let pool = MotivatorApp::rotation(&f);
+        assert_eq!(pick_from(&pool, Some("s1")).unwrap().t, "s1");
+        assert!(pick_from(&[], None).is_none());
+    }
+
+    #[test]
+    fn adjust_weight_clamps_and_reports_mute() {
+        let mut quotes = friend(Expansion::Remix).quotes;
+        assert!(adjust_weight(&mut quotes, "s1", -1)); // 1 → 0 mutes
+        assert!(!adjust_weight(&mut quotes, "s1", 1)); // back in rotation
+        for _ in 0..10 {
+            adjust_weight(&mut quotes, "s1", 1);
+        }
+        assert_eq!(quotes[0].w, 5, "weight clamps at 5");
+        assert!(!adjust_weight(&mut quotes, "unknown line", -1));
+    }
+
+    #[test]
+    fn interval_labels() {
+        assert_eq!(interval_label(3600), "every hour");
+        assert_eq!(interval_label(42), "every 42s");
     }
 }
