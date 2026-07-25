@@ -11,7 +11,8 @@ use egui::{
 use crate::api::{self, ApiEvent};
 use crate::autostart;
 use crate::config::{
-    Accent, Config, Corner, Expansion, Friend, IdleAnim, PhotoMode, Quote, QuoteSrc, TalkAnim,
+    Accent, Config, Corner, Expansion, Friend, IdleAnim, Photo, PhotoMode, Quote, QuoteSrc,
+    TalkAnim,
 };
 use crate::photo;
 use crate::schedule;
@@ -424,13 +425,9 @@ impl MotivatorApp {
             id: id.clone(),
             name: "new friend".into(),
             photo: None,
-            split: 0.52,
-            split_manual: false,
             photo_mode: PhotoMode::Auto,
             talk_anim: TalkAnim::Flap,
             idle_anim: IdleAnim::Off,
-            photo_talk: None,
-            frame_ms: Vec::new(),
             accent,
             quotes: Vec::new(),
             pool: Vec::new(),
@@ -677,23 +674,29 @@ impl MotivatorApp {
                     if let Some(f) = self.cfg.friends.iter_mut().find(|f| f.id == id) {
                         match slot {
                             UploadSlot::Base => {
-                                f.photo = Some(p.path);
-                                f.frame_ms = p.frames.iter().map(|(_, ms)| *ms).collect();
-                                // a fresh photo means a fresh mouth line — the
-                                // manual-override flag belongs to the old one
-                                f.split_manual = false;
-                                if let Some(s) = p.split {
-                                    f.split = s;
-                                }
+                                // the talking still survives a base re-upload;
+                                // everything else starts fresh from detection
+                                let talk = f.photo.take().and_then(|old| old.talk);
+                                f.photo = Some(Photo {
+                                    path: p.path,
+                                    split: p.split.unwrap_or(0.52),
+                                    split_manual: false,
+                                    talk,
+                                    frame_ms: p.frames.iter().map(|(_, ms)| *ms).collect(),
+                                });
                                 // the flap needs a stable mouth line; animated
                                 // frames don't have one
-                                if !f.frame_ms.is_empty() && f.talk_anim == TalkAnim::Flap {
+                                if f.photo.as_ref().is_some_and(|ph| ph.animated())
+                                    && f.talk_anim == TalkAnim::Flap
+                                {
                                     f.talk_anim = TalkAnim::Bounce;
                                 }
                             }
                             UploadSlot::Talk => {
-                                f.photo_talk = Some(p.path);
-                                f.talk_anim = TalkAnim::Swap;
+                                if let Some(ph) = &mut f.photo {
+                                    ph.talk = Some(p.path);
+                                    f.talk_anim = TalkAnim::Swap;
+                                }
                             }
                         }
                     }
@@ -794,15 +797,19 @@ impl MotivatorApp {
 
     fn avatar_tex(&mut self, ctx: &egui::Context, friend_idx: usize) -> Option<AvatarTex> {
         let f = &self.cfg.friends[friend_idx];
-        let base = f.photo.clone()?;
+        let photo = f.photo.clone()?;
         let id = f.id.clone();
         if let Some(t) = self.textures.get(&id) {
             return Some(t.clone());
         }
         let mut frames = Vec::new();
-        if !f.frame_ms.is_empty() {
-            let dir = base.parent().map(Path::to_path_buf).unwrap_or_default();
-            for (n, &ms) in f.frame_ms.iter().enumerate() {
+        if photo.animated() {
+            let dir = photo
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            for (n, &ms) in photo.frame_ms.iter().enumerate() {
                 let p = dir.join(format!("{id}.f{n}.png"));
                 if let Some(t) = load_tex(ctx, &p, format!("photo-{id}-f{n}")) {
                     frames.push((t, ms.max(20)));
@@ -810,11 +817,10 @@ impl MotivatorApp {
             }
         }
         if frames.is_empty() {
-            frames.push((load_tex(ctx, &base, format!("photo-{id}"))?, 0));
+            frames.push((load_tex(ctx, &photo.path, format!("photo-{id}"))?, 0));
         }
-        let talk = f
-            .photo_talk
-            .clone()
+        let talk = photo
+            .talk
             .and_then(|p| load_tex(ctx, &p, format!("photo-{id}-talk")));
         let tex = AvatarTex { frames, talk };
         self.textures.insert(id, tex.clone());
@@ -940,10 +946,10 @@ impl MotivatorApp {
         let accent = pal.accent_color(f.accent);
         let nudges = f.nudges;
         let has_photo = f.photo.is_some();
-        let split = f.split.clamp(0.1, 0.9);
+        let split = f.photo.as_ref().map_or(0.52, |p| p.split).clamp(0.1, 0.9);
         let talk_anim = f.talk_anim;
         let idle_anim = f.idle_anim;
-        let animated = !f.frame_ms.is_empty();
+        let animated = f.photo.as_ref().is_some_and(Photo::animated);
         let letter = f
             .name
             .trim()
@@ -1621,10 +1627,7 @@ impl MotivatorApp {
                 let has_photo = self.active().photo.is_some();
                 if has_photo && self.tiny_button(ui, "use letter instead").clicked() {
                     let id = self.active().id.clone();
-                    let f = self.active_mut();
-                    f.photo = None;
-                    f.photo_talk = None;
-                    f.frame_ms.clear();
+                    self.active_mut().photo = None;
                     self.textures.remove(&id);
                 }
             });
@@ -1655,8 +1658,9 @@ impl MotivatorApp {
         });
         let has_photo = self.active().photo.is_some();
         if has_photo {
-            let has_talk = self.active().photo_talk.is_some();
-            let animated = !self.active().frame_ms.is_empty();
+            let photo = self.active().photo.as_ref().unwrap();
+            let (has_talk, animated, mut split) =
+                (photo.talk.is_some(), photo.animated(), photo.split);
             ui.horizontal(|ui| {
                 let label = if has_talk {
                     "replace talking frame"
@@ -1669,7 +1673,9 @@ impl MotivatorApp {
                 if has_talk && self.tiny_button(ui, "×").clicked() {
                     let id = self.active().id.clone();
                     let f = self.active_mut();
-                    f.photo_talk = None;
+                    if let Some(ph) = &mut f.photo {
+                        ph.talk = None;
+                    }
                     if f.talk_anim == TalkAnim::Swap {
                         f.talk_anim = if animated {
                             TalkAnim::Bounce
@@ -1681,15 +1687,15 @@ impl MotivatorApp {
                 }
             });
             if !animated && self.active().talk_anim == TalkAnim::Flap {
-                let mut split = self.active().split;
                 let label = self.label_text("mouth line");
                 if ui
                     .add(egui::Slider::new(&mut split, 0.10..=0.90).text(label))
                     .changed()
                 {
-                    let f = self.active_mut();
-                    f.split = split;
-                    f.split_manual = true;
+                    if let Some(ph) = &mut self.active_mut().photo {
+                        ph.split = split;
+                        ph.split_manual = true;
+                    }
                 }
             }
             ui.label(self.label_text("talking"));
@@ -2592,13 +2598,9 @@ mod tests {
             id: "t".into(),
             name: "t".into(),
             photo: None,
-            split: 0.52,
-            split_manual: false,
             photo_mode: PhotoMode::Auto,
             talk_anim: TalkAnim::Flap,
             idle_anim: IdleAnim::Off,
-            photo_talk: None,
-            frame_ms: Vec::new(),
             accent: Accent::Orange,
             quotes: vec![
                 Quote {

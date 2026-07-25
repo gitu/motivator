@@ -47,7 +47,7 @@ pub fn encode_card(friend: &Friend, accent: [u8; 3]) -> Result<RgbaImage, String
     let photo = friend
         .photo
         .as_ref()
-        .and_then(|p| image::open(p).ok())
+        .and_then(|p| image::open(&p.path).ok())
         .map(|i| i.to_rgba8());
     let photo_png = match &photo {
         Some(img) => png_bytes(&downscale(img, SHARE_PHOTO))?,
@@ -56,7 +56,7 @@ pub fn encode_card(friend: &Friend, accent: [u8; 3]) -> Result<RgbaImage, String
     let shared = SharedFriend {
         name: friend.name.clone(),
         accent: friend.accent,
-        split: friend.split,
+        split: friend.photo.as_ref().map_or(0.52, |p| p.split),
         quotes: friend.quotes.clone(),
         pool: friend.pool.clone(),
         expansion: friend.expansion,
@@ -142,20 +142,21 @@ pub fn import_into(
         } else {
             s.name
         },
-        photo,
-        split: if s.split.is_finite() {
-            s.split.clamp(0.1, 0.9)
-        } else {
-            0.52
-        },
-        // cards carry the still photo only — animation options start at the
-        // defaults on the receiving side
-        split_manual: false,
+        // cards carry the still photo + mouth line only — animation options
+        // start at the defaults on the receiving side
+        photo: photo.map(|path| {
+            crate::config::Photo::still(
+                path,
+                if s.split.is_finite() {
+                    s.split.clamp(0.1, 0.9)
+                } else {
+                    0.52
+                },
+            )
+        }),
         photo_mode: crate::config::PhotoMode::Auto,
         talk_anim: crate::config::TalkAnim::Flap,
         idle_anim: crate::config::IdleAnim::Off,
-        photo_talk: None,
-        frame_ms: Vec::new(),
         accent: s.accent,
         quotes,
         pool: s.pool,
@@ -297,14 +298,10 @@ mod tests {
         Friend {
             id: "t".into(),
             name: "test pal".into(),
-            photo,
-            split: 0.5,
-            split_manual: false,
+            photo: photo.map(|p| crate::config::Photo::still(p, 0.5)),
             photo_mode: crate::config::PhotoMode::Auto,
             talk_anim: crate::config::TalkAnim::Flap,
             idle_anim: crate::config::IdleAnim::Off,
-            photo_talk: None,
-            frame_ms: Vec::new(),
             accent: Accent::Cyan,
             quotes: vec![
                 Quote::sample("go"),
@@ -488,12 +485,18 @@ mod tests {
             nudges: false,
             interval_secs: 0,
         };
-        let id = import_into(&mut cfg, s, None).unwrap();
+        // ship a tiny photo so the NaN split actually gets sanitized
+        let img = RgbaImage::from_pixel(8, 8, image::Rgba([170, 120, 90, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let id = import_into(&mut cfg, s, Some(png)).unwrap();
         assert_eq!(cfg.friends.len(), n + 1);
         assert_eq!(cfg.active, id);
         let f = cfg.friends.last().unwrap();
         assert_eq!(f.name, "friend");
-        assert_eq!(f.split, 0.52);
+        assert_eq!(f.photo.as_ref().unwrap().split, 0.52);
         assert_eq!(f.quotes[0].w, 5);
         assert_eq!(f.interval_secs, 5);
     }
