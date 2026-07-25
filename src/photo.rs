@@ -184,8 +184,8 @@ fn store_animation(
         if mode == PhotoMode::Auto {
             let transparent = rgba.pixels().filter(|p| p[3] < 128).count();
             if transparent <= (rgba.width() * rgba.height()) as usize / 50 {
-                let r = refs.get_or_insert_with(|| sample_refs(&rgba)).clone();
-                cutout_with_refs(&mut rgba, &r);
+                let r = refs.get_or_insert_with(|| sample_refs(&rgba));
+                cutout_with_refs(&mut rgba, r);
             }
         }
         let path = dir.join(format!("{stem}.f{n}.png"));
@@ -203,15 +203,13 @@ fn store_animation(
 /// and frames `{stem}.f{n}.png`) so re-uploads never leave orphans. Files of
 /// a longer stem like `{stem}.talk.png` have an extra dot and are kept.
 fn remove_stale(dir: &Path, stem: &str) {
+    let prefix = format!("{}.", stem);
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
         let name = e.file_name();
-        let Some(rest) = name
-            .to_str()
-            .and_then(|n| n.strip_prefix(&format!("{stem}.")))
-        else {
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
             continue;
         };
         let is_frame = rest
