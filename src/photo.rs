@@ -61,15 +61,16 @@ fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
         .iter()
         .max_by_key(|f| f.bbox().width() * f.bbox().height())?;
     let bbox = best.bbox();
-    let mouth_y = bbox.y() as f32 + bbox.height() as f32 * 0.74;
-    let refined = snap_above_teeth(
-        img,
-        (bbox.x(), bbox.y(), bbox.width(), bbox.height()),
-        mouth_y,
-    );
+    let b = (bbox.x(), bbox.y(), bbox.width(), bbox.height());
+    // coarse anchor from the face box (lip parting sits ~76.5% down a
+    // SeetaFace box, ±2% across faces), then land exactly on the parting:
+    // the darkest row shadow between the lips
+    let anchor = bbox.y() as f32 + bbox.height() as f32 * 0.765;
+    let parting = darkest_row_near(img, b, anchor);
+    let refined = snap_above_teeth(img, b, parting);
     if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
         eprintln!(
-            "face bbox: x={} y={} w={} h={} (image {}x{}) mouth_y={mouth_y:.1} refined={refined:.1}",
+            "face bbox: x={} y={} w={} h={} (image {}x{}) anchor={anchor:.1} parting={parting:.1} refined={refined:.1}",
             bbox.x(),
             bbox.y(),
             bbox.width(),
@@ -79,6 +80,34 @@ fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
         );
     }
     Some((refined / img.height() as f32).clamp(0.3, 0.85))
+}
+
+/// The lip parting is the darkest horizontal shadow band near the mouth.
+/// Return the darkest row (mean luminance over the central half of the face
+/// box) within a narrow window around the anchor line.
+fn darkest_row_near(img: &RgbaImage, bbox: (i32, i32, u32, u32), anchor: f32) -> f32 {
+    let (bx, _by, bw, bh) = bbox;
+    let win = 0.06 * bh as f32;
+    let y_lo = (anchor - win).max(0.0) as u32;
+    let y_hi = ((anchor + win) as u32).min(img.height().saturating_sub(1));
+    let x_lo = (bx + bw as i32 / 4).clamp(0, img.width() as i32 - 1) as u32;
+    let x_hi = (bx + (bw as i32 * 3) / 4).clamp(0, img.width() as i32 - 1) as u32;
+    if y_lo >= y_hi || x_lo >= x_hi {
+        return anchor;
+    }
+    let mut best = (anchor, f32::MAX);
+    for y in y_lo..=y_hi {
+        let mut sum = 0.0;
+        for x in x_lo..=x_hi {
+            let p = img.get_pixel(x, y);
+            sum += 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+        }
+        let mean = sum / (x_hi - x_lo + 1) as f32;
+        if mean < best.1 {
+            best = (y as f32, mean);
+        }
+    }
+    best.0
 }
 
 /// If teeth are visible (a smile), a split through them puts teeth on both
@@ -140,7 +169,11 @@ fn snap_above_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) -
     if band_top < mouth_y - 0.06 * bh as f32 || band_top > mouth_y + 0.12 * bh as f32 {
         return mouth_y; // stray highlight away from the mouth line
     }
-    (band_top - 0.015 * bh as f32).max(0.0)
+    if mouth_y < band_top {
+        return mouth_y; // already above the teeth — the parting line stands
+    }
+    // hinge right at the teeth top: that IS the parting on an open smile
+    (band_top - 0.005 * bh as f32).max(0.0)
 }
 
 /// Remove the background by flood-filling from the top/left/right borders,
@@ -399,6 +432,23 @@ mod tests {
             "split {snapped} should sit above the teeth band at y=44"
         );
         assert!(snapped > 38.0, "split {snapped} should stay near the mouth");
+    }
+
+    #[test]
+    fn darkest_row_finds_the_lip_parting() {
+        // uniform skin with a dark parting shadow at y=50..52
+        let mut img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        for y in 50..52 {
+            for x in 30..70 {
+                img.put_pixel(x, y, image::Rgba([70, 40, 35, 255]));
+            }
+        }
+        let row = darkest_row_near(&img, (10, 0, 80, 90), 46.0);
+        assert!((50.0..=51.0).contains(&row), "row={row}");
+        // no shadow near the anchor → anchor is kept
+        let flat = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        let kept = darkest_row_near(&flat, (10, 0, 80, 90), 46.0);
+        assert!((40.0..=52.0).contains(&kept), "kept={kept}");
     }
 
     #[test]
