@@ -35,6 +35,9 @@ actually say — with a little talking animation. Teach it which lines land with
   (flood fill from the borders) and the mouth is located by real face
   detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
   fallback) so the head's top half can flap while talking, jaw-snap style
+- **friend cards** — share a friend as a PNG with their whole config (quotes,
+  weights, photo, behavior) embedded in the pixels; copy/paste or send as a
+  file, import via friends → paste card
 - **sizes** — avatar size 56–96 px, bubble duration, corner, all in config →
   behavior; dark/light theme follows the system preference automatically
 
@@ -45,6 +48,9 @@ macOS, via [Homebrew](https://brew.sh):
 ```sh
 brew install --cask gitu/tap/motivator
 ```
+
+The cask puts `motivator` on your PATH and clears the quarantine flag during
+install — start it from a terminal with `motivator`.
 
 macOS / Linux, via install script (installs to `~/.local/bin`):
 
@@ -59,10 +65,11 @@ irm https://raw.githubusercontent.com/gitu/motivator/main/scripts/install.ps1 | 
 ```
 
 Or grab a binary from the [latest release](https://github.com/gitu/motivator/releases)
-(`.tar.gz` for macOS / Linux, `.zip` for Windows), unpack, run. Builds are
-unsigned — on macOS clear the quarantine flag first:
-`xattr -d com.apple.quarantine motivator` (the cask and install script do
-this for you).
+(`.tar.gz` for macOS / Linux, `.zip` for Windows), unpack, run.
+
+Builds are currently unsigned. On macOS the first run needs the quarantine
+flag cleared (`xattr -d com.apple.quarantine motivator` — the cask and
+install script do this for you); on Windows, allow the SmartScreen prompt.
 
 Or build from source:
 
@@ -95,6 +102,23 @@ Settings are stored in `~/.config/motivator/config.json` (mode 0600, since it
 may contain the token). Processed photos live in
 `~/.local/share/motivator/photos/`.
 
+## sharing friends
+
+**config → friend → copy card** puts a *friend card* on the clipboard — a PNG
+of your friend with their entire config (name, quotes and learned weights,
+accent, behavior, and the cut-out photo) steganographically embedded in the
+pixels' low bits. **save card…** writes the same PNG to disk. The recipient
+imports it via **friends → paste card** (or **open card…**) and gets the
+friend exactly as trained. The API key is never part of a card.
+
+Because the data lives in the pixels, it survives clipboard round-trips and
+PNG re-saves — but **not** lossy paths: screenshots of the card, resizing, or
+apps that convert images to JPEG (some messengers do) destroy it. When in
+doubt, send the `.png` as a file attachment.
+
+Headless equivalents: `motivator --share <friend-id> <out.png>` and
+`motivator --import <card.png>`.
+
 ## Wayland note
 
 Wayland compositors don't let apps position their own windows, so by default
@@ -109,8 +133,8 @@ native-Wayland — then use your compositor's window rules to pin the widget
 - **↑ more / ↓ less** — teach it which lines land; a line weighted to 0 is
   muted and struck through in config → quotes
 - **→ next** — another line
-- **chat · friends · config** — chips next to the avatar
-- **right-click the avatar** — quit
+- **right-click the avatar** — chat, friends roster, config, quit; nothing
+  but the face is shown until you ask for it
 
 ## license
 
