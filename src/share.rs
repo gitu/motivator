@@ -1,4 +1,5 @@
-//! Friend cards: a friend's whole config steganographically embedded in a PNG.
+//! Friend cards: a friend's identity and lines steganographically embedded in
+//! a PNG.
 //!
 //! The payload lives in the 2 low bits of each RGB channel (alpha untouched —
 //! the card is rendered fully opaque), so it survives any lossless pixel
@@ -14,6 +15,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Accent, Config, Expansion, Friend, Quote};
 
+/// Everything a card carries: who the friend is and what they say. Local
+/// behavior and LLM-related settings (AI expansion mode, nudge schedule,
+/// quote weights and sources) deliberately stay on the sharer's machine —
+/// the receiver starts from defaults.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SharedFriend {
+    pub name: String,
+    pub accent: Accent,
+    pub split: f32,
+    /// quote texts only — weights and sample/auto/ai tags are not shared
+    pub quotes: Vec<String>,
+    /// canned fallback lines
+    pub pool: Vec<String>,
+}
+
 const MAGIC: &[u8; 4] = b"MOTV";
 const VERSION: u8 = 1;
 /// payload bits hidden per color channel
@@ -24,21 +40,7 @@ const CARD: u32 = 512;
 /// payload photo edge — plenty for a ≤96px on-screen avatar
 const SHARE_PHOTO: u32 = 256;
 
-/// Everything that defines a friend except its local id and photo path.
-/// The photo travels beside it as raw PNG bytes.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SharedFriend {
-    pub name: String,
-    pub accent: Accent,
-    pub split: f32,
-    pub quotes: Vec<Quote>,
-    pub pool: Vec<String>,
-    pub expansion: Expansion,
-    pub nudges: bool,
-    pub interval_secs: u64,
-}
-
-/// Render the friend's card and embed their config + photo in its pixels.
+/// Render the friend's card and embed their identity + photo in its pixels.
 /// `accent` is the friend's accent color (theme-resolved RGB).
 pub fn encode_card(friend: &Friend, accent: [u8; 3]) -> Result<RgbaImage, String> {
     let photo = friend
@@ -54,11 +56,8 @@ pub fn encode_card(friend: &Friend, accent: [u8; 3]) -> Result<RgbaImage, String
         name: friend.name.clone(),
         accent: friend.accent,
         split: friend.split,
-        quotes: friend.quotes.clone(),
+        quotes: friend.quotes.iter().map(|q| q.t.clone()).collect(),
         pool: friend.pool.clone(),
-        expansion: friend.expansion,
-        nudges: friend.nudges,
-        interval_secs: friend.interval_secs,
     };
     let json = serde_json::to_vec(&shared).map_err(|e| e.to_string())?;
     let mut card = render_card(photo.as_ref(), accent);
@@ -102,7 +101,8 @@ pub fn decode_card(img: &RgbaImage) -> Result<(SharedFriend, Option<Vec<u8>>), S
 }
 
 /// Add a decoded friend to the config: mint a fresh id, write the photo to the
-/// photos dir, sanitize ranges, push + activate. Returns the new id.
+/// photos dir, sanitize ranges, push + activate. Behavior settings (expansion,
+/// nudges, interval) start at their defaults. Returns the new id.
 pub fn import_into(
     cfg: &mut Config,
     s: SharedFriend,
@@ -128,10 +128,6 @@ pub fn import_into(
         }
         None => None,
     };
-    let mut quotes = s.quotes;
-    for q in &mut quotes {
-        q.w = q.w.min(5);
-    }
     cfg.friends.push(Friend {
         id: id.clone(),
         name: if s.name.is_empty() {
@@ -146,11 +142,11 @@ pub fn import_into(
             0.52
         },
         accent: s.accent,
-        quotes,
+        quotes: s.quotes.iter().map(|t| Quote::sample(t)).collect(),
         pool: s.pool,
-        expansion: s.expansion,
-        nudges: s.nudges,
-        interval_secs: s.interval_secs.max(5),
+        expansion: Expansion::Off,
+        nudges: false,
+        interval_secs: 1800,
     });
     cfg.active = id.clone();
     Ok(id)
@@ -310,15 +306,30 @@ mod tests {
         let (s, photo) = decode_card(&card).unwrap();
         assert_eq!(s.name, "test pal");
         assert!(matches!(s.accent, Accent::Cyan));
-        assert_eq!(s.quotes.len(), 2);
-        assert_eq!(s.quotes[1].w, 4);
+        assert_eq!(s.quotes, vec!["go".to_string(), "ship it".to_string()]);
         assert_eq!(s.pool, vec!["small steps".to_string()]);
-        assert!(matches!(s.expansion, Expansion::Remix));
-        assert!(s.nudges);
-        assert_eq!(s.interval_secs, 600);
         assert!(photo.is_none());
         // card must be fully opaque so clipboard alpha handling can't hurt it
         assert!(card.pixels().all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn card_payload_carries_only_texts_and_identity() {
+        // the embedded json must not leak llm or local behavior settings
+        let card = encode_card(&friend(None), [80, 200, 255]).unwrap();
+        let bytes = extract_all(&card);
+        let json_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+        let payload: serde_json::Value = serde_json::from_slice(&bytes[9..9 + json_len]).unwrap();
+        let keys: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec!["accent", "name", "pool", "quotes", "split"]);
+        assert!(payload["quotes"][0].is_string(), "quotes are bare texts");
     }
 
     #[test]
@@ -427,15 +438,8 @@ mod tests {
             name: String::new(),
             accent: Accent::Pink,
             split: f32::NAN,
-            quotes: vec![Quote {
-                t: "hi".into(),
-                src: QuoteSrc::Sample,
-                w: 99,
-            }],
+            quotes: vec!["hi".into()],
             pool: Vec::new(),
-            expansion: Expansion::Off,
-            nudges: false,
-            interval_secs: 0,
         };
         let id = import_into(&mut cfg, s, None).unwrap();
         assert_eq!(cfg.friends.len(), n + 1);
@@ -443,7 +447,11 @@ mod tests {
         let f = cfg.friends.last().unwrap();
         assert_eq!(f.name, "friend");
         assert_eq!(f.split, 0.52);
-        assert_eq!(f.quotes[0].w, 5);
-        assert_eq!(f.interval_secs, 5);
+        assert_eq!(f.quotes[0].t, "hi");
+        assert_eq!(f.quotes[0].w, 1);
+        assert!(matches!(f.quotes[0].src, QuoteSrc::Sample));
+        assert!(matches!(f.expansion, Expansion::Off));
+        assert!(!f.nudges);
+        assert_eq!(f.interval_secs, 1800);
     }
 }
