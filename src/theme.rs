@@ -2,7 +2,7 @@
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke};
 
-use crate::config::{Accent, Theme};
+use crate::config::Accent;
 
 pub struct Palette {
     pub background: Color32,
@@ -66,10 +66,69 @@ pub const LIGHT: Palette = Palette {
     shadow_alpha: 34,
 };
 
-pub fn palette(theme: Theme) -> &'static Palette {
+pub fn palette(theme: egui::Theme) -> &'static Palette {
     match theme {
-        Theme::Dark => &DARK,
-        Theme::Light => &LIGHT,
+        egui::Theme::Dark => &DARK,
+        egui::Theme::Light => &LIGHT,
+    }
+}
+
+/// Ask the desktop what color scheme it prefers.
+///
+/// winit reports no system theme on X11/Wayland, so on Linux we read the XDG
+/// desktop portal's `color-scheme` setting over D-Bus (the same source GTK and
+/// Firefox use) — shelling out like the fontconfig lookup below. Returns None
+/// when the desktop expresses no preference or the lookup fails.
+#[cfg(target_os = "linux")]
+pub fn system_theme() -> Option<egui::Theme> {
+    portal_color_scheme().or_else(gnome_color_scheme)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn system_theme() -> Option<egui::Theme> {
+    None
+}
+
+/// org.freedesktop.appearance color-scheme: 0 = no preference, 1 = dark, 2 = light
+#[cfg(target_os = "linux")]
+fn portal_color_scheme() -> Option<egui::Theme> {
+    let out = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply=literal",
+            "--reply-timeout=1000",
+            "--dest=org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings.Read",
+            "string:org.freedesktop.appearance",
+            "string:color-scheme",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let reply = String::from_utf8_lossy(&out.stdout);
+    match reply.rsplit("uint32").next()?.trim().parse::<u32>().ok()? {
+        1 => Some(egui::Theme::Dark),
+        2 => Some(egui::Theme::Light),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_color_scheme() -> Option<egui::Theme> {
+    let out = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    if s.contains("prefer-dark") {
+        Some(egui::Theme::Dark)
+    } else if s.contains("prefer-light") {
+        Some(egui::Theme::Light)
+    } else {
+        None
     }
 }
 

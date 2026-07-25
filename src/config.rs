@@ -36,13 +36,6 @@ impl Corner {
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Theme {
-    Dark,
-    Light,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Accent {
     Orange = 0,
     Lime = 1,
@@ -174,7 +167,6 @@ pub struct Config {
     /// how many lines "generate with ai" asks for at once
     #[serde(default = "default_gen_count")]
     pub gen_count: u8,
-    pub theme: Theme,
     /// Wayland compositors don't let clients pick a screen position; running
     /// through XWayland does. Set false to stay native-Wayland (the widget
     /// will appear wherever the compositor decides).
@@ -192,7 +184,6 @@ impl Default for Config {
             avatar_size: 68.0,
             bubble_secs: 8.0,
             gen_count: 3,
-            theme: Theme::Dark,
             prefer_x11: true,
             api: ApiConfig::default(),
             friends: default_friends(),
@@ -341,6 +332,7 @@ mod tests {
     #[test]
     fn old_config_without_new_fields_still_loads() {
         // simulates a config written before prefer_x11 / split / pool existed
+        // (and after theme was still a config field — now ignored)
         let json = r#"{
             "corner": "bottom-right", "avatar_size": 68.0, "bubble_secs": 8.0,
             "theme": "dark",

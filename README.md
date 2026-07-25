@@ -35,8 +35,8 @@ actually say — with a little talking animation. Teach it which lines land with
   (flood fill from the borders) and the mouth is located by real face
   detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
   fallback) so the head's top half can flap while talking, jaw-snap style
-- **sizes** — avatar size 56–96 px, bubble duration, corner, dark/light theme,
-  all in config → behavior
+- **sizes** — avatar size 56–96 px, bubble duration, corner, all in config →
+  behavior; dark/light theme follows the system preference automatically
 
 ## install
 

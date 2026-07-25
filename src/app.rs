@@ -8,7 +8,7 @@ use egui::{
 };
 
 use crate::api::{self, ApiEvent};
-use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc, Theme};
+use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc};
 use crate::photo;
 use crate::theme::{self, Palette};
 
@@ -79,7 +79,12 @@ pub struct MotivatorApp {
     photo_tx: Sender<(String, Result<photo::Processed, String>)>,
 
     textures: HashMap<String, egui::TextureHandle>,
-    last_applied_theme: Option<Theme>,
+    /// resolved system theme currently in effect
+    theme: egui::Theme,
+    /// desktop preference from the portal watcher thread (None = no signal)
+    sys_theme: Option<egui::Theme>,
+    theme_rx: Receiver<egui::Theme>,
+    style_applied: bool,
 }
 
 impl MotivatorApp {
@@ -87,6 +92,29 @@ impl MotivatorApp {
         theme::install_fonts(&cc.egui_ctx);
         let (api_tx, api_rx) = channel();
         let (photo_tx, photo_rx) = channel();
+
+        // the desktop's color-scheme preference: read once now so the first
+        // frame paints correctly, then watch for changes from a thread (winit
+        // delivers no theme events on X11/Wayland)
+        let sys_theme = theme::system_theme();
+        let (theme_tx, theme_rx) = channel();
+        {
+            let egui_ctx = cc.egui_ctx.clone();
+            let mut last = sys_theme;
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let t = theme::system_theme();
+                if t != last {
+                    last = t;
+                    if let Some(t) = t {
+                        if theme_tx.send(t).is_err() {
+                            return;
+                        }
+                        egui_ctx.request_repaint();
+                    }
+                }
+            });
+        }
         let mut app = MotivatorApp {
             cfg,
             dirty_since: None,
@@ -112,7 +140,10 @@ impl MotivatorApp {
             photo_rx,
             photo_tx,
             textures: HashMap::new(),
-            last_applied_theme: None,
+            theme: sys_theme.unwrap_or(egui::Theme::Dark),
+            sys_theme,
+            theme_rx,
+            style_applied: false,
         };
         // greet with the first line in rotation, like the design's initial bubble
         app.speak();
@@ -120,7 +151,7 @@ impl MotivatorApp {
     }
 
     fn pal(&self) -> &'static Palette {
-        theme::palette(self.cfg.theme)
+        theme::palette(self.theme)
     }
 
     fn active_idx(&self) -> usize {
@@ -1369,23 +1400,6 @@ impl MotivatorApp {
         {
             self.mark_dirty();
         }
-        ui.horizontal(|ui| {
-            ui.label(self.label_text("theme"));
-            let mut t = self.cfg.theme;
-            egui::ComboBox::from_id_salt("theme")
-                .selected_text(
-                    RichText::new(if t == Theme::Dark { "dark" } else { "light" })
-                        .font(theme::font_ui()),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut t, Theme::Dark, "dark");
-                    ui.selectable_value(&mut t, Theme::Light, "light");
-                });
-            if t != self.cfg.theme {
-                self.cfg.theme = t;
-                self.mark_dirty();
-            }
-        });
     }
 
     fn tab_api(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1600,9 +1614,16 @@ impl eframe::App for MotivatorApp {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        if self.last_applied_theme != Some(self.cfg.theme) {
+        while let Ok(t) = self.theme_rx.try_recv() {
+            self.sys_theme = Some(t);
+        }
+        // the portal preference wins; winit's system theme covers the
+        // platforms where it works (and its dark fallback everywhere else)
+        let resolved = self.sys_theme.unwrap_or_else(|| ctx.theme());
+        if !self.style_applied || resolved != self.theme {
+            self.theme = resolved;
             theme::apply_style(&ctx, self.pal());
-            self.last_applied_theme = Some(self.cfg.theme);
+            self.style_applied = true;
         }
         self.drain_events();
         self.tick_timers();
