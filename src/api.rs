@@ -23,7 +23,7 @@ pub fn configured(api: &ApiConfig) -> bool {
     !api.base_url.trim().is_empty() && !api.model.trim().is_empty()
 }
 
-fn complete(api: &ApiConfig, prompt: &str) -> Result<String, String> {
+fn complete(api: &ApiConfig, system: &str, user: &str) -> Result<String, String> {
     let url = format!("{}/chat/completions", api.base_url.trim_end_matches('/'));
     // report http error bodies ourselves instead of ureq's bare status error
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -35,10 +35,15 @@ fn complete(api: &ApiConfig, prompt: &str) -> Result<String, String> {
     if !key.is_empty() {
         req = req.header("Authorization", format!("Bearer {key}"));
     }
+    let mut messages = Vec::new();
+    if !system.trim().is_empty() {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    messages.push(json!({"role": "user", "content": user}));
     let mut resp = req
         .send_json(json!({
             "model": api.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": 0.9,
             "max_tokens": 200,
         }))
@@ -72,6 +77,59 @@ fn samples(friend: &Friend) -> String {
         .join("\n")
 }
 
+/// The chat system prompt: the friend's custom prompt if set (with {name},
+/// {description} and {quotes} placeholders substituted), otherwise the
+/// built-in template from name + description + sample quotes.
+pub fn chat_system_prompt(friend: &Friend) -> String {
+    let custom = friend.chat_prompt.trim();
+    if !custom.is_empty() {
+        return custom
+            .replace("{name}", &friend.name)
+            .replace("{description}", friend.persona.trim())
+            .replace("{quotes}", &samples(friend));
+    }
+    let mut p = format!("You are {}, a friend who motivates me.", friend.name);
+    let persona = friend.persona.trim();
+    if !persona.is_empty() {
+        p.push_str(&format!(" {persona}"));
+    }
+    if !friend.quotes.is_empty() {
+        p.push_str(&format!(
+            "\nYour voice, learned from lines you actually say:\n{}",
+            samples(friend)
+        ));
+    }
+    p.push_str("\nReply in 1-2 short sentences, lowercase, exactly in that voice. Respond with only the reply text.");
+    p
+}
+
+/// The quote-generation prompt: persona (when set) plus existing lines as
+/// voice anchor and do-not-repeat list — works with either one alone.
+fn generate_prompt(friend: &Friend, count: usize) -> String {
+    let mut p = format!(
+        "{} motivates a friend with short punchy lines.",
+        friend.name
+    );
+    let persona = friend.persona.trim();
+    if !persona.is_empty() {
+        p.push_str(&format!(" {persona}"));
+    }
+    if !friend.quotes.is_empty() {
+        p.push_str(&format!(
+            "\nLines they already say:\n{}\nWrite {count} new short lines (max 10 words each) in exactly the same voice and tone. Do not repeat any existing line.",
+            samples(friend)
+        ));
+    } else {
+        p.push_str(&format!(
+            "\nWrite {count} short lines (max 10 words each) they would say, in that voice."
+        ));
+    }
+    p.push_str(&format!(
+        " Reply with only a JSON array of {count} strings."
+    ));
+    p
+}
+
 pub fn spawn_reply(
     api: ApiConfig,
     friend: Friend,
@@ -80,13 +138,9 @@ pub fn spawn_reply(
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let prompt = format!(
-            "You are {}, a friend who motivates me. Your voice, learned from lines you actually say:\n{}\n\nI just told you: \"{}\"\nReply in 1-2 short sentences, lowercase, exactly in that voice. Respond with only the reply text.",
-            friend.name,
-            samples(&friend),
-            user_text
-        );
-        let _ = tx.send(ApiEvent::Reply(complete(&api, &prompt)));
+        let system = chat_system_prompt(&friend);
+        let user = format!("I just told you: \"{user_text}\"");
+        let _ = tx.send(ApiEvent::Reply(complete(&api, &system, &user)));
         ctx.request_repaint();
     });
 }
@@ -99,12 +153,8 @@ pub fn spawn_generate(
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let prompt = format!(
-            "Lines {} says to motivate a friend:\n{}\nWrite {count} new short lines (max 10 words each) in exactly the same voice and tone. Do not repeat any existing line. Reply with only a JSON array of {count} strings.",
-            friend.name,
-            samples(&friend)
-        );
-        let lines = complete(&api, &prompt).and_then(|text| {
+        let prompt = generate_prompt(&friend, count);
+        let lines = complete(&api, "", &prompt).and_then(|text| {
             let start = text.find('[').ok_or("no JSON array in reply")?;
             let end = text.rfind(']').ok_or("no JSON array in reply")?;
             let arr: Vec<String> =
@@ -122,7 +172,7 @@ pub fn spawn_generate(
 pub fn spawn_test(api: ApiConfig, tx: Sender<ApiEvent>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let result =
-            complete(&api, "Reply with the single word: ok").map(|_| "connected ✓".to_string());
+            complete(&api, "", "Reply with the single word: ok").map(|_| "connected ✓".to_string());
         let _ = tx.send(ApiEvent::Tested(result));
         ctx.request_repaint();
     });
@@ -191,7 +241,7 @@ mod tests {
             api_key: "sekret-token".into(),
             model: "test-model".into(),
         };
-        let out = complete(&api, "hello").unwrap();
+        let out = complete(&api, "be brief", "hello").unwrap();
         assert_eq!(out, "less planning. more shipping.");
         let req = handle.join().unwrap();
         assert!(req.starts_with("POST /v1/chat/completions"));
@@ -201,6 +251,28 @@ mod tests {
         let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
         let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["model"], "test-model");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "be brief");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "hello");
+    }
+
+    #[test]
+    fn empty_system_prompt_is_omitted() {
+        let (base_url, handle) =
+            mock_server(r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#);
+        let api = ApiConfig {
+            base_url,
+            api_key: String::new(),
+            model: "m".into(),
+        };
+        complete(&api, "", "hello").unwrap();
+        let req = handle.join().unwrap();
+        let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
+        let body: Value = serde_json::from_str(body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
     }
 
     #[test]
@@ -211,7 +283,64 @@ mod tests {
             api_key: String::new(),
             model: "m".into(),
         };
-        let err = complete(&api, "hello").unwrap_err();
+        let err = complete(&api, "", "hello").unwrap_err();
         assert!(err.contains("malformed"), "{err}");
+    }
+
+    fn friend(persona: &str, chat_prompt: &str, quotes: &[&str]) -> Friend {
+        use crate::config::{Accent, Expansion, Quote};
+        Friend {
+            id: "t".into(),
+            name: "marc".into(),
+            photo: None,
+            split: 0.52,
+            persona: persona.into(),
+            chat_prompt: chat_prompt.into(),
+            accent: Accent::Orange,
+            quotes: quotes.iter().map(|t| Quote::sample(t)).collect(),
+            pool: Vec::new(),
+            expansion: Expansion::Off,
+            nudges: false,
+            interval_secs: 60,
+        }
+    }
+
+    #[test]
+    fn default_chat_prompt_combines_name_persona_and_quotes() {
+        let p = chat_system_prompt(&friend("blunt. direct.", "", &["do it now"]));
+        assert!(p.contains("You are marc"), "{p}");
+        assert!(p.contains("blunt. direct."), "{p}");
+        assert!(p.contains("- do it now"), "{p}");
+        assert!(p.contains("1-2 short sentences"), "{p}");
+    }
+
+    #[test]
+    fn default_chat_prompt_works_without_persona_or_quotes() {
+        let p = chat_system_prompt(&friend("", "", &[]));
+        assert!(p.contains("You are marc"), "{p}");
+        assert!(!p.contains("lines you actually say"), "{p}");
+    }
+
+    #[test]
+    fn custom_chat_prompt_substitutes_placeholders() {
+        let f = friend("grumpy", "Play {name} ({description}):\n{quotes}", &["go"]);
+        assert_eq!(chat_system_prompt(&f), "Play marc (grumpy):\n- go");
+        // plain override without placeholders is used verbatim
+        let f = friend("grumpy", "just be nice", &["go"]);
+        assert_eq!(chat_system_prompt(&f), "just be nice");
+    }
+
+    #[test]
+    fn generate_prompt_uses_persona_and_quotes() {
+        let p = generate_prompt(&friend("stoic calm", "", &["breathe"]), 5);
+        assert!(p.contains("stoic calm"), "{p}");
+        assert!(p.contains("- breathe"), "{p}");
+        assert!(p.contains("Do not repeat"), "{p}");
+        assert!(p.contains("JSON array of 5 strings"), "{p}");
+        // description alone is enough — no quotes required
+        let p = generate_prompt(&friend("stoic calm", "", &[]), 3);
+        assert!(p.contains("stoic calm"), "{p}");
+        assert!(p.contains("JSON array of 3 strings"), "{p}");
+        assert!(!p.contains("already say"), "{p}");
     }
 }

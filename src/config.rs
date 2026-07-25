@@ -66,16 +66,6 @@ pub enum QuoteSrc {
     New,
 }
 
-impl QuoteSrc {
-    pub fn tag(self) -> &'static str {
-        match self {
-            QuoteSrc::Sample => "sample",
-            QuoteSrc::Auto => "auto",
-            QuoteSrc::New => "ai",
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Expansion {
@@ -118,6 +108,14 @@ pub struct Friend {
     /// mouth line as a fraction of image height — the talking flap splits here
     #[serde(default = "default_split")]
     pub split: f32,
+    /// who they are and how they talk — feeds the chat prompt and quote
+    /// generation alongside the sample quotes
+    #[serde(default)]
+    pub persona: String,
+    /// custom chat system prompt; empty = built-in template. Supports
+    /// {name}, {description} and {quotes} placeholders.
+    #[serde(default)]
+    pub chat_prompt: String,
     pub accent: Accent,
     pub quotes: Vec<Quote>,
     /// canned fallback lines used by "remix" expansion when no AI is configured
@@ -247,6 +245,8 @@ fn default_friends() -> Vec<Friend> {
             name: "marc".into(),
             photo: None,
             split: 0.52,
+            persona: "blunt tech-lead energy — deadlines over feelings, allergic to excuses".into(),
+            chat_prompt: String::new(),
             accent: Accent::Orange,
             quotes: vec![
                 Quote::sample("Do your fucking job."),
@@ -267,6 +267,8 @@ fn default_friends() -> Vec<Friend> {
             name: "ana".into(),
             photo: None,
             split: 0.52,
+            persona: "gentle and grounding — small steps, self-care, never guilt-trips".into(),
+            chat_prompt: String::new(),
             accent: Accent::Lime,
             quotes: vec![
                 Quote::sample("you've got this — one thing at a time."),
@@ -286,6 +288,8 @@ fn default_friends() -> Vec<Friend> {
             name: "coach k".into(),
             photo: None,
             split: 0.52,
+            persona: "no-nonsense trainer — discipline, reps, earned rest".into(),
+            chat_prompt: String::new(),
             accent: Accent::Violet,
             quotes: vec![
                 Quote::sample("five more minutes of focus."),
@@ -373,11 +377,14 @@ mod tests {
 
     #[test]
     fn config_serde_roundtrip() {
-        let cfg = Config {
+        let mut cfg = Config {
             pos: Some((120.5, 640.0)),
             ..Default::default()
         };
+        cfg.friends[0].chat_prompt = "you are {name}: {description}".into();
         let back = cfg.roundtrip();
+        assert_eq!(back.friends[0].persona, cfg.friends[0].persona);
+        assert_eq!(back.friends[0].chat_prompt, "you are {name}: {description}");
         assert_eq!(back.friends.len(), cfg.friends.len());
         assert_eq!(back.active, "marc");
         assert!(back.prefer_x11);
@@ -443,6 +450,9 @@ mod tests {
         assert_eq!(cfg.pos, None);
         assert_eq!(cfg.friends[0].split, 0.52);
         assert!(cfg.friends[0].pool.is_empty());
+        // persona / chat prompt arrived later: old configs load with them empty
+        assert!(cfg.friends[0].persona.is_empty());
+        assert!(cfg.friends[0].chat_prompt.is_empty());
         // schedule arrived later still: existing configs keep an empty
         // schedule (no surprise example windows), and it stays off
         assert!(cfg.schedule.is_empty());
