@@ -7,9 +7,9 @@
 
 ![motivator demo — a corner avatar popping up motivational lines](assets/demo.gif)
 
-*(demo avatar: an AI-generated person — StyleGAN,
-[public domain via Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Woman_1.jpg) —
-run through the widget's own photo pipeline)*
+*(demo avatar: an AI-generated person — StyleGAN2,
+[public domain via Wikimedia Commons](https://commons.wikimedia.org/wiki/File:GAN_Mensch_StyleGAN2.png) —
+cut out and mouth-line-detected fully automatically by the widget's photo pipeline)*
 
 A Rust implementation of the *Motivator Widget* design (claude.ai/design,
 schr.ag design system). A small always-on-top, frameless, transparent widget
@@ -32,8 +32,9 @@ actually say — with a little talking animation. Teach it which lines land with
 - **friends roster** — multiple friends, each with their own lines, accent
   color, photo, and nudge schedule
 - **photo avatars** — upload a photo; the background is removed automatically
-  (flood fill from the borders) and a mouth line is estimated so the head's
-  top half can flap while talking, jaw-snap style
+  (flood fill from the borders) and the mouth is located by real face
+  detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
+  fallback) so the head's top half can flap while talking, jaw-snap style
 - **sizes** — avatar size 56–96 px, bubble duration, corner, dark/light theme,
   all in config → behavior
 
@@ -113,4 +114,7 @@ native-Wayland — then use your compositor's window rules to pin the widget
 
 ## license
 
-[MIT](LICENSE)
+[MIT](LICENSE). The embedded face-detection model
+(`assets/seeta_fd_frontal_v1.0.bin`) is the SeetaFace frontal model by the
+VIPL group (ICT, Chinese Academy of Sciences), BSD-2-Clause, via the
+[rustface](https://github.com/atomashpolskiy/rustface) project.

@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
+/// SeetaFace frontal detection model (BSD-2, VIPL group / rustface project)
+static FACE_MODEL: &[u8] = include_bytes!("../assets/seeta_fd_frontal_v1.0.bin");
+
 pub struct Processed {
     pub path: PathBuf,
     pub split: f32,
@@ -17,23 +20,160 @@ pub fn process_and_store(src: &Path, friend_id: &str) -> Result<Processed, Strin
     let img = img.resize(512, 512, image::imageops::FilterType::Triangle);
     let mut rgba = img.to_rgba8();
 
+    // find the mouth on the pristine photo before the cut-out touches it;
+    // the silhouette heuristic is only the no-face-found fallback
+    let face_split = mouth_from_face(&rgba);
+
     // pre-cut PNGs (real transparency) skip the flood fill — the alpha channel
-    // already is the cut-out; we only estimate the mouth line
+    // already is the cut-out
     let transparent = rgba.pixels().filter(|p| p[3] < 128).count();
-    let split = if transparent > (rgba.width() * rgba.height()) as usize / 50 {
-        split_heuristic(&rgba).unwrap_or(0.52)
+    let heuristic_split = if transparent > (rgba.width() * rgba.height()) as usize / 50 {
+        split_heuristic(&rgba)
     } else {
-        match cutout(&mut rgba) {
-            Some(split) => split,
-            None => split_heuristic(&rgba).unwrap_or(0.52),
-        }
+        cutout(&mut rgba).or_else(|| split_heuristic(&rgba))
     };
+    let split = face_split.or(heuristic_split).unwrap_or(0.52);
 
     let dir = crate::config::photos_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{friend_id}.png"));
     rgba.save(&path).map_err(|e| e.to_string())?;
     Ok(Processed { path, split })
+}
+
+/// Detect the (largest) face and hinge the flap in the middle of the mouth:
+/// a coarse anchor from the face box leads to the lip-parting shadow, and
+/// the split lands mid-teeth (when visible) or just inside the mouth, so the
+/// upper teeth lift with the head while the jaw stays.
+/// Returns None when no face is found.
+fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
+    let model = rustface::model::read_model(std::io::Cursor::new(FACE_MODEL)).ok()?;
+    let mut detector = rustface::create_detector_with_model(model);
+    detector.set_min_face_size(20);
+    detector.set_score_thresh(2.0);
+    detector.set_pyramid_scale_factor(0.8);
+    detector.set_slide_window_step(4, 4);
+
+    let gray = image::DynamicImage::ImageRgba8(img.clone()).to_luma8();
+    let data = rustface::ImageData::new(&gray, gray.width(), gray.height());
+    let faces = detector.detect(&data);
+    let best = faces
+        .iter()
+        .max_by_key(|f| f.bbox().width() * f.bbox().height())?;
+    let bbox = best.bbox();
+    let b = (bbox.x(), bbox.y(), bbox.width(), bbox.height());
+    // coarse anchor from the face box (lip parting sits ~76.5% down a
+    // SeetaFace box, ±2% across faces), then land exactly on the parting:
+    // the darkest row shadow between the lips
+    let anchor = bbox.y() as f32 + bbox.height() as f32 * 0.765;
+    let parting = darkest_row_near(img, b, anchor);
+    // hinge in the MIDDLE of the mouth so upper teeth lift with the head and
+    // the lower lip stays — like a real jaw. Teeth band center when teeth are
+    // detectable, otherwise the parting shadow nudged into the mouth.
+    let refined = center_on_teeth(img, b, parting).unwrap_or(parting + 0.02 * bbox.height() as f32);
+    if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
+        eprintln!(
+            "face bbox: x={} y={} w={} h={} (image {}x{}) anchor={anchor:.1} parting={parting:.1} refined={refined:.1}",
+            bbox.x(),
+            bbox.y(),
+            bbox.width(),
+            bbox.height(),
+            img.width(),
+            img.height()
+        );
+    }
+    Some((refined / img.height() as f32).clamp(0.3, 0.85))
+}
+
+/// The lip parting is the darkest horizontal shadow band near the mouth.
+/// Return the darkest row (mean luminance over the central half of the face
+/// box) within a narrow window around the anchor line.
+fn darkest_row_near(img: &RgbaImage, bbox: (i32, i32, u32, u32), anchor: f32) -> f32 {
+    let (bx, _by, bw, bh) = bbox;
+    let win = 0.06 * bh as f32;
+    let y_lo = (anchor - win).max(0.0) as u32;
+    let y_hi = ((anchor + win) as u32).min(img.height().saturating_sub(1));
+    let x_lo = (bx + bw as i32 / 4).clamp(0, img.width() as i32 - 1) as u32;
+    let x_hi = (bx + (bw as i32 * 3) / 4).clamp(0, img.width() as i32 - 1) as u32;
+    if y_lo >= y_hi || x_lo >= x_hi {
+        return anchor;
+    }
+    let mut best = (anchor, f32::MAX);
+    for y in y_lo..=y_hi {
+        let mut sum = 0.0;
+        for x in x_lo..=x_hi {
+            let p = img.get_pixel(x, y);
+            sum += 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+        }
+        let mean = sum / (x_hi - x_lo + 1) as f32;
+        if mean < best.1 {
+            best = (y as f32, mean);
+        }
+    }
+    best.0
+}
+
+/// Locate the visible teeth band (bright, low-chroma rows in the central
+/// strip of the face) around the candidate mouth line and return its center
+/// — splitting mid-teeth sends the upper set with the lifting head and keeps
+/// the lower set with the jaw, like a mouth actually opening.
+/// Returns None when no plausible band exists (closed mouth, warm-lit teeth
+/// that match skin tones, pale-skin false positives).
+fn center_on_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) -> Option<f32> {
+    let (bx, _by, bw, bh) = bbox;
+    let win = 0.12 * bh as f32;
+    let y_lo = (mouth_y - win).max(0.0) as u32;
+    let y_hi = ((mouth_y + win) as u32).min(img.height().saturating_sub(1));
+    // central half of the face box — teeth live there, collars/ears don't
+    let x_lo = (bx + bw as i32 / 4).clamp(0, img.width() as i32 - 1) as u32;
+    let x_hi = (bx + (bw as i32 * 3) / 4).clamp(0, img.width() as i32 - 1) as u32;
+    if y_lo >= y_hi || x_lo >= x_hi {
+        return None;
+    }
+    let toothy: Vec<bool> = (y_lo..=y_hi)
+        .map(|y| {
+            let n = (x_lo..=x_hi)
+                .filter(|&x| {
+                    let p = img.get_pixel(x, y);
+                    let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+                    let mx = r.max(g).max(b);
+                    let mn = r.min(g).min(b);
+                    // bright and near-neutral — teeth, not (warm) skin or lips
+                    p[3] > 128 && mx > 130 && mx - mn < 45
+                })
+                .count();
+            n as u32 * 8 > x_hi - x_lo // ≥ 12.5% of the strip width
+        })
+        .collect();
+    // longest contiguous toothy run; require a couple of rows to avoid
+    // snapping to specular highlights
+    let (mut best_start, mut best_len) = (0usize, 0usize);
+    let (mut run_start, mut run_len) = (0usize, 0usize);
+    for (i, &t) in toothy.iter().enumerate() {
+        if t {
+            if run_len == 0 {
+                run_start = i;
+            }
+            run_len += 1;
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+    if best_len < 2.max((0.015 * bh as f32) as usize) {
+        return None; // no teeth visible (closed mouth)
+    }
+    if best_len as f32 > 0.08 * bh as f32 {
+        return None; // far too tall for teeth — pale skin, not a mouth
+    }
+    let band_top = y_lo as f32 + best_start as f32;
+    if band_top < mouth_y - 0.06 * bh as f32 || band_top > mouth_y + 0.12 * bh as f32 {
+        return None; // stray highlight away from the mouth line
+    }
+    Some(band_top + best_len as f32 / 2.0)
 }
 
 /// Remove the background by flood-filling from the top/left/right borders,
@@ -163,7 +303,7 @@ fn keep_largest_component(px: &mut [u8], w: usize, h: usize) {
 
 /// Estimate the mouth line from the opaque silhouette: top of head → widest
 /// point (ears/hair) → narrowest below it (neck); mouth sits ~80% of the way
-/// from crown to neck. Clamped to [0.3, 0.72] of image height.
+/// from crown to neck. Clamped to [0.3, 0.78] of image height.
 pub fn split_heuristic(img: &RgbaImage) -> Option<f32> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let px = img.as_raw();
@@ -199,8 +339,8 @@ pub fn split_heuristic(img: &RgbaImage) -> Option<f32> {
     if neck_y <= top_y + 4 {
         return None;
     }
-    let split = (top_y as f32 + 0.8 * (neck_y - top_y) as f32) / h as f32;
-    Some(split.clamp(0.3, 0.72))
+    let split = (top_y as f32 + 0.85 * (neck_y - top_y) as f32) / h as f32;
+    Some(split.clamp(0.3, 0.78))
 }
 
 #[cfg(test)]
@@ -246,7 +386,7 @@ mod tests {
         assert!(img.get_pixel(32, 20)[3] > 0, "head must stay opaque");
         assert_eq!(img.get_pixel(8, 3)[3], 0, "floating island must be pruned");
         // mouth ≈ 80% from crown (y=6) to neck minimum → around y≈0.5–0.6 of height
-        assert!((0.3..=0.72).contains(&split), "split={split}");
+        assert!((0.3..=0.78).contains(&split), "split={split}");
     }
 
     #[test]
@@ -272,7 +412,49 @@ mod tests {
         // alpha preserved: corners stay transparent, center stays opaque
         assert_eq!(out.get_pixel(1, 1)[3], 0);
         assert!(out.get_pixel(out.width() / 2, out.height() / 2)[3] > 0);
-        assert!((0.3..=0.72).contains(&p.split), "split={}", p.split);
+        assert!((0.3..=0.78).contains(&p.split), "split={}", p.split);
+    }
+
+    #[test]
+    fn split_centers_on_visible_teeth() {
+        // warm "skin" face with a bright neutral teeth band at y=44..48
+        let mut img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        for y in 44..48 {
+            for x in 35..65 {
+                img.put_pixel(x, y, image::Rgba([230, 228, 225, 255]));
+            }
+        }
+        let bbox = (10, 0, 80u32, 90u32);
+        // the hinge goes mid-band: upper teeth lift, lower part stays
+        let center = center_on_teeth(&img, bbox, 43.0).expect("band found");
+        assert!(
+            (45.0..=47.0).contains(&center),
+            "split {center} should sit mid-teeth (band 44..48)"
+        );
+    }
+
+    #[test]
+    fn darkest_row_finds_the_lip_parting() {
+        // uniform skin with a dark parting shadow at y=50..52
+        let mut img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        for y in 50..52 {
+            for x in 30..70 {
+                img.put_pixel(x, y, image::Rgba([70, 40, 35, 255]));
+            }
+        }
+        let row = darkest_row_near(&img, (10, 0, 80, 90), 46.0);
+        assert!((50.0..=51.0).contains(&row), "row={row}");
+        // no shadow near the anchor → anchor is kept
+        let flat = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        let kept = darkest_row_near(&flat, (10, 0, 80, 90), 46.0);
+        assert!((40.0..=52.0).contains(&kept), "kept={kept}");
+    }
+
+    #[test]
+    fn no_teeth_band_on_closed_mouth() {
+        // closed mouth: uniform warm skin, no bright neutral band
+        let img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        assert!(center_on_teeth(&img, (10, 0, 80, 90), 46.0).is_none());
     }
 
     #[test]
