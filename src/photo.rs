@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
+/// SeetaFace frontal detection model (BSD-2, VIPL group / rustface project)
+static FACE_MODEL: &[u8] = include_bytes!("../assets/seeta_fd_frontal_v1.0.bin");
+
 pub struct Processed {
     pub path: PathBuf,
     pub split: f32,
@@ -17,23 +20,60 @@ pub fn process_and_store(src: &Path, friend_id: &str) -> Result<Processed, Strin
     let img = img.resize(512, 512, image::imageops::FilterType::Triangle);
     let mut rgba = img.to_rgba8();
 
+    // find the mouth on the pristine photo before the cut-out touches it;
+    // the silhouette heuristic is only the no-face-found fallback
+    let face_split = mouth_from_face(&rgba);
+
     // pre-cut PNGs (real transparency) skip the flood fill — the alpha channel
-    // already is the cut-out; we only estimate the mouth line
+    // already is the cut-out
     let transparent = rgba.pixels().filter(|p| p[3] < 128).count();
-    let split = if transparent > (rgba.width() * rgba.height()) as usize / 50 {
-        split_heuristic(&rgba).unwrap_or(0.52)
+    let heuristic_split = if transparent > (rgba.width() * rgba.height()) as usize / 50 {
+        split_heuristic(&rgba)
     } else {
-        match cutout(&mut rgba) {
-            Some(split) => split,
-            None => split_heuristic(&rgba).unwrap_or(0.52),
-        }
+        cutout(&mut rgba).or_else(|| split_heuristic(&rgba))
     };
+    let split = face_split.or(heuristic_split).unwrap_or(0.52);
 
     let dir = crate::config::photos_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{friend_id}.png"));
     rgba.save(&path).map_err(|e| e.to_string())?;
     Ok(Processed { path, split })
+}
+
+/// Detect the (largest) face and place the mouth line at 74% of the face
+/// box height — the lip line's position within SeetaFace's detection box,
+/// calibrated on sample portraits. (The original design used 82% of the
+/// browser FaceDetector's box, which frames faces differently.)
+/// Returns None when no face is found.
+fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
+    let model = rustface::model::read_model(std::io::Cursor::new(FACE_MODEL)).ok()?;
+    let mut detector = rustface::create_detector_with_model(model);
+    detector.set_min_face_size(20);
+    detector.set_score_thresh(2.0);
+    detector.set_pyramid_scale_factor(0.8);
+    detector.set_slide_window_step(4, 4);
+
+    let gray = image::DynamicImage::ImageRgba8(img.clone()).to_luma8();
+    let data = rustface::ImageData::new(&gray, gray.width(), gray.height());
+    let faces = detector.detect(&data);
+    let best = faces
+        .iter()
+        .max_by_key(|f| f.bbox().width() * f.bbox().height())?;
+    let bbox = best.bbox();
+    if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
+        eprintln!(
+            "face bbox: x={} y={} w={} h={} (image {}x{})",
+            bbox.x(),
+            bbox.y(),
+            bbox.width(),
+            bbox.height(),
+            img.width(),
+            img.height()
+        );
+    }
+    let mouth_y = bbox.y() as f32 + bbox.height() as f32 * 0.74;
+    Some((mouth_y / img.height() as f32).clamp(0.3, 0.85))
 }
 
 /// Remove the background by flood-filling from the top/left/right borders,
