@@ -31,6 +31,9 @@ actually say — with a little talking animation. Teach it which lines land with
   fallbacks when no endpoint is configured or the call fails
 - **friends roster** — multiple friends, each with their own lines, accent
   color, photo, and nudge schedule
+- **schedule** — time windows that hand the widget to a different friend:
+  the work friend 09:00–17:00 on workdays, the coach over lunch, the
+  wind-down friend in the evening; overlaps resolve to the shortest window
 - **photo avatars** — upload a photo; the background is removed automatically
   (flood fill from the borders) and the mouth is located by real face
   detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
@@ -120,6 +123,50 @@ doubt, send the `.png` as a file attachment.
 Headless equivalents: `motivator --share <friend-id> <out.png>` and
 `motivator --import <card.png>`.
 
+## schedule: the right friend at the right time
+
+![the schedule tab — three time windows handing the widget to different friends,
+with the currently active window shown at the top](assets/schedule-tab.png)
+
+*(the wind-down window is active, so leo has taken over and tells you to
+shut it down — the work and sport windows will bring back marc and coach k
+tomorrow)*
+
+**config → schedule** holds a list of time windows, each handing the widget
+to one friend: pick the days, the start/end time, and who takes over. Turn on
+*switch friends on a schedule* and the avatar switches by itself — the new
+friend greets you and nudges on their own interval for the whole window.
+
+The rules are simple:
+
+- **shortest window wins** — a 12:00–13:00 sport window inside a 09:00–17:00
+  work window takes over for lunch; work resumes at 13:00
+- **hand picks hold until the next boundary** — choosing a friend yourself
+  mid-window sticks until any window starts or ends, then the schedule
+  takes over again
+- **midnight is fine** — a 22:00–01:00 window simply runs into the next day
+- outside every window (and with the switch off) nothing changes: you keep
+  whoever you picked
+
+The windows are stored in the config file in a hand-editable form, so you can
+also maintain them in `~/.config/motivator/config.json` directly:
+
+```json
+"schedule_enabled": true,
+"schedule": [
+  { "label": "work",  "friend": "marc",  "days": ["mon","tue","wed","thu","fri"],
+    "start": "09:00", "end": "17:00", "enabled": true },
+  { "label": "sport", "friend": "coach", "days": ["mon","tue","wed","thu","fri"],
+    "start": "12:00", "end": "13:00", "enabled": true },
+  { "label": "wind down — pc away", "friend": "ana",
+    "days": ["mon","tue","wed","thu","fri","sat","sun"],
+    "start": "18:00", "end": "22:00", "enabled": true }
+]
+```
+
+A fresh install ships these three windows as a template with the master
+switch off; existing configs are left untouched.
+
 ## Wayland note
 
 Wayland compositors don't let apps position their own windows, so by default
@@ -136,6 +183,8 @@ native-Wayland — then use your compositor's window rules to pin the widget
 - **→ next** — another line
 - **right-click the avatar** — chat, friends roster, config, quit; nothing
   but the face is shown until you ask for it
+- **config → schedule** — let different friends take over at different times
+  of day
 
 ## license
 

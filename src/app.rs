@@ -1750,17 +1750,18 @@ impl MotivatorApp {
         let mut remove: Option<usize> = None;
         let mut edited = false;
         egui::ScrollArea::vertical()
-            .max_height(170.0)
+            .max_height(240.0)
             .show(ui, |ui| {
                 ui.set_width(294.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 for i in 0..self.cfg.schedule.len() {
                     let mut e = self.cfg.schedule[i].clone();
                     ui.horizontal(|ui| {
+                        ui.set_max_width(294.0);
                         ui.checkbox(&mut e.enabled, "");
                         ui.add(
                             egui::TextEdit::singleline(&mut e.label)
-                                .desired_width(110.0)
+                                .desired_width(100.0)
                                 .font(theme::font_ui()),
                         );
                         let known = friends.iter().find(|(id, _)| *id == e.friend);
@@ -1771,7 +1772,7 @@ impl MotivatorApp {
                             pal.destructive
                         };
                         egui::ComboBox::from_id_salt(("sched-friend", i))
-                            .width(86.0)
+                            .width(72.0)
                             .selected_text(
                                 RichText::new(sel).font(theme::font_ui()).color(sel_color),
                             )
@@ -1787,7 +1788,8 @@ impl MotivatorApp {
                         });
                     });
                     ui.horizontal(|ui| {
-                        ui.add_space(22.0);
+                        ui.set_max_width(294.0);
+                        ui.add_space(16.0);
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (d, l) in ["m", "t", "w", "t", "f", "s", "s"].iter().enumerate() {
                             if self.day_toggle(ui, l, e.days.contains(d as u8)).clicked() {
@@ -2035,7 +2037,7 @@ fn interval_label(secs: u64) -> String {
 /// pick a time of day in 30-minute steps
 fn time_combo(ui: &mut egui::Ui, salt: (&str, usize), t: &mut schedule::TimeOfDay) {
     egui::ComboBox::from_id_salt(salt)
-        .width(58.0)
+        .width(46.0)
         .selected_text(RichText::new(t.to_string()).font(theme::font_ui()))
         .show_ui(ui, |ui| {
             for step in 0..48u16 {
