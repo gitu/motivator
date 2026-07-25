@@ -119,6 +119,106 @@ pub fn spawn_generate(
     });
 }
 
+/// Ask the endpoint's image-edits API (OpenAI `gpt-image-1`) for the same
+/// person with their mouth open — a talking frame for the swap animation.
+/// Blocking; returns PNG bytes.
+pub fn talk_frame(api: &ApiConfig, photo_png: &[u8]) -> Result<Vec<u8>, String> {
+    let url = format!("{}/images/edits", api.base_url.trim_end_matches('/'));
+    let boundary = format!("motivator-{:016x}", fastrand::u64(..));
+    let mut body = Vec::new();
+    let text_part = |body: &mut Vec<u8>, name: &str, value: &str| {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    };
+    text_part(&mut body, "model", "gpt-image-1");
+    text_part(
+        &mut body,
+        "prompt",
+        "Edit this photo: the exact same person, same framing, same colors, same lighting, \
+         but with the mouth clearly open as if speaking mid-sentence. Keep the transparent \
+         background fully transparent.",
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; \
+             filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(photo_png);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut req = agent.post(&url).header(
+        "Content-Type",
+        format!("multipart/form-data; boundary={boundary}"),
+    );
+    let key = api.api_key.trim();
+    if !key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let mut resp = req.send(&body[..]).map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!(
+            "http {code}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    let json: Value = resp.body_mut().read_json().map_err(|e| e.to_string())?;
+    let b64 = json["data"][0]["b64_json"]
+        .as_str()
+        .ok_or_else(|| "malformed response (no data[0].b64_json)".to_string())?;
+    b64_decode(b64)
+}
+
+/// Standard-alphabet base64 (the only shape image APIs return) — small
+/// enough that a dependency isn't worth it.
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Result<u32, String> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("invalid base64 byte {c}")),
+        }
+    }
+    let s: Vec<u8> = s
+        .bytes()
+        .filter(|b| !matches!(b, b' ' | b'\r' | b'\n' | b'\t'))
+        .collect();
+    let end = s.iter().position(|&b| b == b'=').unwrap_or(s.len());
+    let s = &s[..end];
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for chunk in s.chunks(4) {
+        if chunk.len() < 2 {
+            return Err("truncated base64".into());
+        }
+        let mut acc = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            acc |= val(c)? << (18 - 6 * i);
+        }
+        out.push((acc >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((acc >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(acc as u8);
+        }
+    }
+    Ok(out)
+}
+
 pub fn spawn_test(api: ApiConfig, tx: Sender<ApiEvent>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let result =
@@ -213,5 +313,36 @@ mod tests {
         };
         let err = complete(&api, "hello").unwrap_err();
         assert!(err.contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn talk_frame_sends_multipart_and_decodes_b64() {
+        // "hello png" == aGVsbG8gcG5n
+        let (base_url, handle) = mock_server(r#"{"data":[{"b64_json":"aGVsbG8gcG5n"}]}"#);
+        let api = ApiConfig {
+            base_url,
+            api_key: "tok".into(),
+            model: "m".into(),
+        };
+        let png = b"\x89PNG fake image bytes";
+        let out = talk_frame(&api, png).unwrap();
+        assert_eq!(out, b"hello png");
+        let req = handle.join().unwrap();
+        assert!(req.starts_with("POST /v1/images/edits"));
+        assert!(req.contains("authorization: Bearer tok"));
+        assert!(req.contains("multipart/form-data; boundary=motivator-"));
+        assert!(req.contains("name=\"model\"\r\n\r\ngpt-image-1"));
+        assert!(req.contains("name=\"prompt\""));
+        assert!(req.contains("filename=\"photo.png\""));
+        assert!(req.contains("PNG fake image bytes"));
+    }
+
+    #[test]
+    fn b64_decoder_handles_padding_and_rejects_garbage() {
+        assert_eq!(b64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(b64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(b64_decode("Zm9vYmFy").unwrap(), b"foobar");
+        assert_eq!(b64_decode("Zm9v\nYmFy").unwrap(), b"foobar", "newlines ok");
+        assert!(b64_decode("Zm9v!!").is_err());
     }
 }

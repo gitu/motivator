@@ -157,6 +157,7 @@ pub fn import_into(
         photo_mode: crate::config::PhotoMode::Auto,
         talk_anim: crate::config::TalkAnim::Flap,
         idle_anim: crate::config::IdleAnim::Off,
+        blink: true,
         accent: s.accent,
         quotes,
         pool: s.pool,
@@ -302,6 +303,7 @@ mod tests {
             photo_mode: crate::config::PhotoMode::Auto,
             talk_anim: crate::config::TalkAnim::Flap,
             idle_anim: crate::config::IdleAnim::Off,
+            blink: true,
             accent: Accent::Cyan,
             quotes: vec![
                 Quote::sample("go"),

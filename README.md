@@ -37,16 +37,18 @@ actually say — with a little talking animation. Teach it which lines land with
   the work friend 09:00–17:00 on workdays, the coach over lunch, the
   wind-down friend in the evening; overlaps resolve to the shortest window
 - **photo avatars** — upload a photo; the background is removed automatically
-  (flood fill from the borders) and the mouth is located by real face
+  (flood fill from the borders) and the face is measured by real face
   detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
-  fallback) so the head's top half can flap while talking, jaw-snap style
+  fallback): mouth line via the lip-parting shadow and teeth band, eye band
+  via a brow-then-eye darkness search, chin and face extent from the box
 - **photo control** — pick per friend how uploads are processed: *auto
   cut-out*, *already cut out* (keeps your PNG's transparency, skips the flood
   fill), or *keep as-is* (stored untouched, no resize, no detection); a mouth
   line slider corrects the detected flap hinge when needed
-- **animation styles** — per friend: a talking style (jaw-flap, bounce, sway,
-  two-frame swap with an uploaded mouth-open still, or none) plus a continuous
-  idle animation (breathe, sway, or *alive*) so the avatar never sits frozen
+- **animation styles** — per friend: a talking style (mouth-warp *jaw*,
+  flap, bounce, sway, two-frame swap, or none), a continuous idle animation
+  (breathe, sway, or *alive*), and natural blinking on the detected eyes,
+  so the avatar never sits frozen
 - **animated avatars** — upload an animated GIF / APNG / animated WebP and it
   plays as the avatar, background cut-out and all (up to 48 frames)
 - **friend cards** — share a friend as a PNG with their whole config (quotes,
@@ -63,19 +65,25 @@ Every friend picks a talking style and an idle animation in config → friend
 (right-click the avatar → config). Talking plays on every poke, nudge, and
 chat reply:
 
-| flap | bounce | sway | swap |
+| jaw | flap | bounce | sway | swap |
+|:---:|:---:|:---:|:---:|:---:|
+| ![jaw mouth-warp talking](assets/anim-jaw.gif) | ![jaw-flap talking](assets/anim-flap.gif) | ![bounce talking](assets/anim-bounce.gif) | ![sway talking](assets/anim-sway.gif) | ![two-frame swap](assets/anim-swap.gif) |
+
+*jaw* (the default) warps the mouth open on an organic double-sine cadence:
+the head lifts off the face-detected mouth line and the opening is filled
+with stretched lip pixels, so the mouth really opens instead of showing a
+slice. *flap* is the old-school jaw-snap. Correct the hinge with the *mouth
+line* slider if the detector guessed wrong. *swap* alternates with a second
+mouth-open still — upload one, or press **✨ generate with ai** to have the
+configured endpoint's image API (`gpt-image-1`) make one from the photo.
+
+Idle animations run continuously, and friends with a detected eye band
+blink every few seconds (with the occasional double blink — toggle per
+friend):
+
+| breathe | sway | alive | blink |
 |:---:|:---:|:---:|:---:|
-| ![jaw-flap talking](assets/anim-flap.gif) | ![bounce talking](assets/anim-bounce.gif) | ![sway talking](assets/anim-sway.gif) | ![two-frame swap](assets/anim-swap.gif) |
-
-*flap* hinges the head at the face-detected mouth line (correct it with the
-*mouth line* slider if the detector guessed wrong); *swap* alternates with a
-second uploaded still — ideally the same photo with the mouth open.
-
-Idle animations run continuously, so the avatar never sits frozen:
-
-| breathe | sway | alive |
-|:---:|:---:|:---:|
-| ![breathe idle](assets/anim-breathe.gif) | ![sway idle](assets/anim-idle-sway.gif) | ![alive idle](assets/anim-alive.gif) |
+| ![breathe idle](assets/anim-breathe.gif) | ![sway idle](assets/anim-idle-sway.gif) | ![alive idle](assets/anim-alive.gif) | ![blinking](assets/anim-blink.gif) |
 
 *alive* combines breathing and swaying with an occasional micro-bob. And for
 avatars that bring their own motion: upload an animated GIF / APNG / WebP and

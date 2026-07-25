@@ -24,12 +24,18 @@ fn main() -> eframe::Result {
             Some(_) => panic!("{usage}"),
         };
         match photo::process_and_store(std::path::Path::new(src), id, mode) {
-            Ok(p) => println!(
-                "ok {} split={} frames={}",
-                p.path.display(),
-                p.split.map_or("none".into(), |s| format!("{s:.3}")),
-                p.frames.len()
-            ),
+            Ok(p) => {
+                let face = p.face.map_or("face=none".to_string(), |f| {
+                    format!(
+                        "split={:.3} chin={:.3} eyes={}",
+                        f.split,
+                        f.chin,
+                        f.eyes
+                            .map_or("none".to_string(), |(y, h)| format!("{y:.3}h{h:.3}"))
+                    )
+                });
+                println!("ok {} {face} frames={}", p.path.display(), p.frames.len());
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);

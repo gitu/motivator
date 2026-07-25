@@ -20,10 +20,24 @@ const STILL_EDGE: u32 = 512;
 /// raw files above this become one resized PNG — a texture has to fit in VRAM
 const RAW_EDGE: u32 = 2048;
 
+/// Facial geometry extracted from a photo, all values as fractions of the
+/// image dimensions. Drives the talking warp and the blink overlay.
+#[derive(Clone, Copy)]
+pub struct Face {
+    /// mouth line — the talking flap/jaw hinge
+    pub split: f32,
+    /// eye band (center y, height); None when no face (or no eyes) was found
+    pub eyes: Option<(f32, f32)>,
+    /// bottom of the jaw — the lower bound of the mouth-warp slice
+    pub chin: f32,
+    /// horizontal face extent, used to bound the blink overlay
+    pub face_x: (f32, f32),
+}
+
 pub struct Processed {
     pub path: PathBuf,
-    /// detected mouth line; None when detection was skipped (raw mode)
-    pub split: Option<f32>,
+    /// detected facial geometry; None when detection was skipped (raw mode)
+    pub face: Option<Face>,
     /// animated frames (path, delay ms); empty for a still
     pub frames: Vec<(PathBuf, u32)>,
 }
@@ -36,6 +50,17 @@ pub fn process_and_store(src: &Path, stem: &str, mode: PhotoMode) -> Result<Proc
     let ext = src.extension().and_then(|e| e.to_str());
     let dir = crate::config::photos_dir();
     process_bytes(&bytes, ext, &dir, stem, mode)
+}
+
+/// Same pipeline for in-memory bytes (e.g. an AI-generated talking frame).
+pub fn process_and_store_bytes(
+    bytes: &[u8],
+    ext: Option<&str>,
+    stem: &str,
+    mode: PhotoMode,
+) -> Result<Processed, String> {
+    let dir = crate::config::photos_dir();
+    process_bytes(bytes, ext, &dir, stem, mode)
 }
 
 fn process_bytes(
@@ -64,9 +89,9 @@ fn process_bytes(
     );
     let mut rgba = img.to_rgba8();
 
-    // find the mouth on the pristine photo before the cut-out touches it;
+    // read the face off the pristine photo before the cut-out touches it;
     // the silhouette heuristic is only the no-face-found fallback
-    let face_split = mouth_from_face(&rgba);
+    let detected = detect_face(&rgba);
 
     // pre-cut images (real transparency) skip the flood fill — the alpha
     // channel already is the cut-out; "already cut out" mode forces that
@@ -78,15 +103,36 @@ fn process_bytes(
     } else {
         cutout(&mut rgba).or_else(|| split_heuristic(&rgba))
     };
-    let split = face_split.or(heuristic_split).unwrap_or(0.52);
+    let face = detected.unwrap_or_else(|| silhouette_face(&rgba, heuristic_split));
 
     let path = dir.join(format!("{stem}.png"));
     rgba.save(&path).map_err(|e| e.to_string())?;
     Ok(Processed {
         path,
-        split: Some(split),
+        face: Some(face),
         frames: Vec::new(),
     })
+}
+
+/// No face found: build coarse geometry from the silhouette split — enough
+/// for the jaw warp, but no eyes (no blinking on unknown geometry).
+fn silhouette_face(img: &RgbaImage, split: Option<f32>) -> Face {
+    let split = split.unwrap_or(0.52);
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    // face width ≈ opaque extent on the mouth row
+    let y = ((split * h as f32) as usize).min(h - 1);
+    let px = img.as_raw();
+    let opaque: Vec<usize> = (0..w).filter(|&x| px[(y * w + x) * 4 + 3] > 128).collect();
+    let face_x = match (opaque.first(), opaque.last()) {
+        (Some(&a), Some(&b)) if b > a => (a as f32 / w as f32, b as f32 / w as f32),
+        _ => (0.25, 0.75),
+    };
+    Face {
+        split,
+        eyes: None,
+        chin: (split + 0.17).min(0.98),
+        face_x,
+    }
 }
 
 /// Raw mode: the file lands on disk byte-identical (any format the renderer
@@ -114,7 +160,7 @@ fn store_raw(
     };
     Ok(Processed {
         path,
-        split: None,
+        face: None,
         frames: Vec::new(),
     })
 }
@@ -170,7 +216,7 @@ fn store_animation(
 ) -> Result<Processed, String> {
     let mut out = Vec::new();
     let mut refs: Option<Vec<[i32; 3]>> = None;
-    let mut split = None;
+    let mut face = None;
     for (n, (frame, ms)) in frames.into_iter().enumerate() {
         let img = image::DynamicImage::ImageRgba8(frame).resize(
             ANIM_EDGE,
@@ -179,7 +225,10 @@ fn store_animation(
         );
         let mut rgba = img.to_rgba8();
         if n == 0 && mode != PhotoMode::Raw {
-            split = mouth_from_face(&rgba).or_else(|| split_heuristic(&rgba));
+            face = Some(
+                detect_face(&rgba)
+                    .unwrap_or_else(|| silhouette_face(&rgba, split_heuristic(&rgba))),
+            );
         }
         if mode == PhotoMode::Auto {
             let transparent = rgba.pixels().filter(|p| p[3] < 128).count();
@@ -194,7 +243,7 @@ fn store_animation(
     }
     Ok(Processed {
         path: out[0].0.clone(),
-        split,
+        face,
         frames: out,
     })
 }
@@ -222,12 +271,12 @@ fn remove_stale(dir: &Path, stem: &str) {
     }
 }
 
-/// Detect the (largest) face and hinge the flap in the middle of the mouth:
-/// a coarse anchor from the face box leads to the lip-parting shadow, and
-/// the split lands mid-teeth (when visible) or just inside the mouth, so the
-/// upper teeth lift with the head while the jaw stays.
+/// Detect the (largest) face and read its geometry: the flap/jaw hinge in
+/// the middle of the mouth (coarse anchor from the face box → lip-parting
+/// shadow → mid-teeth when visible), the eye band for blinking, the chin,
+/// and the face's horizontal extent.
 /// Returns None when no face is found.
-fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
+fn detect_face(img: &RgbaImage) -> Option<Face> {
     let model = rustface::model::read_model(std::io::Cursor::new(FACE_MODEL)).ok()?;
     let mut detector = rustface::create_detector_with_model(model);
     detector.set_min_face_size(20);
@@ -243,27 +292,101 @@ fn mouth_from_face(img: &RgbaImage) -> Option<f32> {
         .max_by_key(|f| f.bbox().width() * f.bbox().height())?;
     let bbox = best.bbox();
     let b = (bbox.x(), bbox.y(), bbox.width(), bbox.height());
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (bx, by, bw, bh) = (b.0 as f32, b.1 as f32, b.2 as f32, b.3 as f32);
     // coarse anchor from the face box (lip parting sits ~76.5% down a
     // SeetaFace box, ±2% across faces), then land exactly on the parting:
     // the darkest row shadow between the lips
-    let anchor = bbox.y() as f32 + bbox.height() as f32 * 0.765;
+    let anchor = by + bh * 0.765;
     let parting = darkest_row_near(img, b, anchor);
     // hinge in the MIDDLE of the mouth so upper teeth lift with the head and
     // the lower lip stays — like a real jaw. Teeth band center when teeth are
     // detectable, otherwise the parting shadow nudged into the mouth.
-    let refined = center_on_teeth(img, b, parting).unwrap_or(parting + 0.02 * bbox.height() as f32);
+    let refined = center_on_teeth(img, b, parting).unwrap_or(parting + 0.02 * bh);
+    let split = (refined / h).clamp(0.3, 0.85);
+    let eyes = eyes_in_box(img, b);
+    // a SeetaFace box ends roughly at the chin
+    let chin = ((by + 1.02 * bh) / h).clamp((split + 0.04).min(0.97), 0.99);
+    let face_x = (
+        ((bx + 0.08 * bw) / w).clamp(0.0, 1.0),
+        ((bx + 0.92 * bw) / w).clamp(0.0, 1.0),
+    );
     if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
         eprintln!(
-            "face bbox: x={} y={} w={} h={} (image {}x{}) anchor={anchor:.1} parting={parting:.1} refined={refined:.1}",
-            bbox.x(),
-            bbox.y(),
-            bbox.width(),
-            bbox.height(),
-            img.width(),
-            img.height()
+            "face bbox: x={bx} y={by} w={bw} h={bh} (image {w}x{h}) anchor={anchor:.1} \
+             parting={parting:.1} refined={refined:.1} eyes={eyes:?} chin={chin:.3}"
         );
     }
-    Some((refined / img.height() as f32).clamp(0.3, 0.85))
+    Some(Face {
+        split,
+        eyes,
+        chin,
+        face_x,
+    })
+}
+
+/// Locate the eye band inside the face box. Both the brow and the eyes are
+/// dark horizontal bands in the upper face — per face half, take the darkest
+/// row in the upper window as the brow, then the darkest row clearly below
+/// it as the eye; the halves must agree, so hair or glasses edges can't fake
+/// an eye line. Returns (center y, band height) as image fractions.
+fn eyes_in_box(img: &RgbaImage, bbox: (i32, i32, u32, u32)) -> Option<(f32, f32)> {
+    let (bx, by, bw, bh) = (bbox.0 as f32, bbox.1 as f32, bbox.2 as f32, bbox.3 as f32);
+    let h = img.height() as f32;
+    let half = |x_lo: f32, x_hi: f32| -> Option<f32> {
+        let (y_lo, y_hi) = (by + 0.20 * bh, by + 0.55 * bh);
+        let brow = darkest_row_in(img, x_lo, x_hi, y_lo, y_hi)?;
+        // the eye shadow sits below the brow; when nothing darker shows up
+        // down there, the "brow" row most likely was the eye already
+        darkest_row_in(img, x_lo, x_hi, brow + 0.06 * bh, y_hi).or(Some(brow))
+    };
+    let l = half(bx + 0.13 * bw, bx + 0.45 * bw)?;
+    let r = half(bx + 0.55 * bw, bx + 0.87 * bw)?;
+    if (l - r).abs() > 0.06 * bh {
+        return None; // halves disagree — better no blink than a wrong one
+    }
+    Some(((l + r) / 2.0 / h, 0.11 * bh / h))
+}
+
+/// Darkest row (mean luminance over opaque pixels) within the window, or
+/// None when the window is degenerate or has no contrast worth trusting.
+fn darkest_row_in(img: &RgbaImage, x_lo: f32, x_hi: f32, y_lo: f32, y_hi: f32) -> Option<f32> {
+    let x_lo = (x_lo.max(0.0) as u32).min(img.width().saturating_sub(1));
+    let x_hi = (x_hi.max(0.0) as u32).min(img.width().saturating_sub(1));
+    let y_lo = (y_lo.max(0.0) as u32).min(img.height().saturating_sub(1));
+    let y_hi = (y_hi.max(0.0) as u32).min(img.height().saturating_sub(1));
+    if x_lo >= x_hi || y_lo >= y_hi {
+        return None;
+    }
+    let mut best: Option<(f32, f32)> = None; // (row, mean luminance)
+    let mut sum_all = 0.0;
+    let mut rows = 0.0;
+    for y in y_lo..=y_hi {
+        let mut sum = 0.0;
+        let mut n = 0u32;
+        for x in x_lo..=x_hi {
+            let p = img.get_pixel(x, y);
+            if p[3] > 128 {
+                sum += 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+                n += 1;
+            }
+        }
+        if n * 3 < x_hi - x_lo {
+            continue; // mostly transparent row — outside the subject
+        }
+        let mean = sum / n as f32;
+        sum_all += mean;
+        rows += 1.0;
+        if best.is_none_or(|(_, m)| mean < m) {
+            best = Some((y as f32, mean));
+        }
+    }
+    let (row, min_mean) = best?;
+    // flat skin has no eye/brow shadow — demand real contrast
+    if rows < 3.0 || min_mean > 0.92 * (sum_all / rows) {
+        return None;
+    }
+    Some(row)
 }
 
 /// The lip parting is the darkest horizontal shadow band near the mouth.
@@ -612,7 +735,7 @@ mod tests {
         // alpha preserved: corners stay transparent, center stays opaque
         assert_eq!(out.get_pixel(1, 1)[3], 0);
         assert!(out.get_pixel(out.width() / 2, out.height() / 2)[3] > 0);
-        let split = p.split.expect("still photos report a split");
+        let split = p.face.expect("still photos report a face").split;
         assert!((0.3..=0.78).contains(&split), "split={split}");
         assert!(p.frames.is_empty());
     }
@@ -652,7 +775,7 @@ mod tests {
         .unwrap();
         let out = image::open(&p.path).unwrap().to_rgba8();
         assert!(out.pixels().all(|px| px[3] == 255), "no pixel may be cut");
-        assert!(p.split.is_some(), "precut still detects the mouth");
+        assert!(p.face.is_some(), "precut still detects the mouth");
     }
 
     #[test]
@@ -661,7 +784,7 @@ mod tests {
         let bytes = png_bytes(&portrait());
         let p = process_bytes(&bytes, Some("png"), &dir, "x", PhotoMode::Raw).unwrap();
         assert_eq!(std::fs::read(&p.path).unwrap(), bytes);
-        assert_eq!(p.split, None, "raw mode skips detection");
+        assert!(p.face.is_none(), "raw mode skips detection");
         assert!(p.frames.is_empty());
     }
 
@@ -704,7 +827,7 @@ mod tests {
         assert!(p.path.ends_with("x.png"), "fallback is a png, not x.jpg");
         let out = image::open(&p.path).unwrap();
         assert!(out.width() <= RAW_EDGE && out.height() <= RAW_EDGE);
-        assert_eq!(p.split, None);
+        assert!(p.face.is_none());
     }
 
     fn gif_bytes(frames: &[(RgbaImage, u32)]) -> Vec<u8> {
@@ -810,6 +933,59 @@ mod tests {
         let flat = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
         let kept = darkest_row_near(&flat, (10, 0, 80, 90), 46.0);
         assert!((40.0..=52.0).contains(&kept), "kept={kept}");
+    }
+
+    #[test]
+    fn eyes_found_below_the_brow() {
+        // warm skin, a dark brow band at y=24..26 and a darker eye band at
+        // y=34..36 across both halves of the face box
+        let mut img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        for y in 24..27 {
+            for x in 15..85 {
+                img.put_pixel(x, y, image::Rgba([120, 90, 70, 255]));
+            }
+        }
+        for y in 34..37 {
+            for x in 15..85 {
+                img.put_pixel(x, y, image::Rgba([55, 40, 35, 255]));
+            }
+        }
+        let (ey, eh) = eyes_in_box(&img, (10, 0, 80, 90)).expect("eyes found");
+        assert!(
+            (0.32..=0.38).contains(&ey),
+            "eye line {ey} should sit on the darker band"
+        );
+        assert!(eh > 0.05 && eh < 0.15, "band height {eh}");
+    }
+
+    #[test]
+    fn no_eyes_on_flat_skin_or_tilted_mismatch() {
+        // flat skin — no contrast, no eyes
+        let img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        assert!(eyes_in_box(&img, (10, 0, 80, 90)).is_none());
+        // left "eye" high, right "eye" low — halves disagree, no blink
+        let mut img = RgbaImage::from_pixel(100, 100, image::Rgba([200, 150, 120, 255]));
+        for x in 22..45 {
+            img.put_pixel(x, 22, image::Rgba([50, 40, 35, 255]));
+        }
+        for x in 55..80 {
+            img.put_pixel(x, 46, image::Rgba([50, 40, 35, 255]));
+        }
+        assert!(eyes_in_box(&img, (10, 0, 80, 90)).is_none());
+    }
+
+    #[test]
+    fn silhouette_fallback_has_geometry_but_no_eyes() {
+        // silhouette geometry is read off the cut-out, not the raw photo
+        let mut img = portrait();
+        cutout(&mut img).expect("plausible cut-out");
+        let face = silhouette_face(&img, Some(0.55));
+        assert!(face.eyes.is_none(), "no eyes without a detected face");
+        assert!((face.chin - 0.72).abs() < 1e-5);
+        // the mouth row (y=35) crosses the head (x 22..42) — face_x must
+        // cover exactly that opaque extent, not the full image
+        assert!(face.face_x.0 > 0.2 && face.face_x.1 < 0.8);
+        assert!(face.face_x.1 > face.face_x.0);
     }
 
     #[test]
