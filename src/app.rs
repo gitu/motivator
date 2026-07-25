@@ -9,7 +9,7 @@ use egui::{
 
 use crate::api::{self, ApiEvent};
 use crate::autostart;
-use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc};
+use crate::config::{Accent, Config, Corner, Expansion, Friend, Quote, QuoteSrc, TokenParam};
 use crate::photo;
 use crate::schedule;
 use crate::share;
@@ -1992,6 +1992,29 @@ impl MotivatorApp {
             self.mark_dirty();
         }
         ui.horizontal(|ui| {
+            ui.label(self.label_text("max reply tokens"));
+            if ui
+                .add(egui::DragValue::new(&mut self.cfg.api.max_tokens).range(16..=4096))
+                .changed()
+            {
+                self.mark_dirty();
+            }
+            ui.label(self.label_text("· sent as"));
+            let mut param = self.cfg.api.token_param;
+            egui::ComboBox::from_id_salt("token-param")
+                .selected_text(RichText::new(param.label()).font(theme::font_ui()))
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for p in TokenParam::ALL {
+                        ui.selectable_value(&mut param, p, p.label());
+                    }
+                });
+            if param != self.cfg.api.token_param {
+                self.cfg.api.token_param = param;
+                self.mark_dirty();
+            }
+        });
+        ui.horizontal(|ui| {
             if ui
                 .add(egui::Button::new(
                     RichText::new("test connection").font(theme::font_ui()),
@@ -2008,11 +2031,9 @@ impl MotivatorApp {
                     .color(pal.muted_fg),
             );
         });
-        ui.label(
-            self.label_text(
-                "env overrides: MOTIVATOR_BASE_URL · MOTIVATOR_API_KEY · MOTIVATOR_MODEL",
-            ),
-        );
+        ui.label(self.label_text(
+            "env overrides: MOTIVATOR_BASE_URL · MOTIVATOR_API_KEY · MOTIVATOR_MODEL · MOTIVATOR_MAX_TOKENS · MOTIVATOR_TOKEN_PARAM",
+        ));
     }
 
     /// stack panels + bubble + avatar row in corner-appropriate order
