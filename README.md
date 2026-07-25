@@ -40,10 +40,29 @@ actually say — with a little talking animation. Teach it which lines land with
 
 ## install
 
-Grab a binary from the [latest release](https://github.com/gitu/motivator/releases)
+macOS, via [Homebrew](https://brew.sh):
+
+```sh
+brew install --cask gitu/tap/motivator
+```
+
+macOS / Linux, via install script (installs to `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gitu/motivator/main/scripts/install.sh | bash
+```
+
+Windows, via PowerShell (installs to `%LOCALAPPDATA%\Programs\motivator`):
+
+```powershell
+irm https://raw.githubusercontent.com/gitu/motivator/main/scripts/install.ps1 | iex
+```
+
+Or grab a binary from the [latest release](https://github.com/gitu/motivator/releases)
 (`.tar.gz` for macOS / Linux, `.zip` for Windows), unpack, run. Builds are
 unsigned — on macOS clear the quarantine flag first:
-`xattr -d com.apple.quarantine motivator`.
+`xattr -d com.apple.quarantine motivator` (the cask and install script do
+this for you).
 
 Or build from source:
 
