@@ -52,6 +52,16 @@ pub struct MotivatorApp {
     cfg: Config,
     dirty_since: Option<Instant>,
 
+    /// effective corner for this frame — the screen quadrant `cfg.pos` sits
+    /// in, or `cfg.corner` while no custom position is set
+    place: Corner,
+    /// avatar tile in window coords, recorded during layout so the window
+    /// can be anchored on the avatar afterwards
+    avatar_rect: Option<Rect>,
+    /// screen-space offset between the pointer and the avatar center while a
+    /// drag is in flight
+    drag_grab: Option<Vec2>,
+
     panel: Option<Panel>,
     tab: Tab,
 
@@ -87,9 +97,13 @@ impl MotivatorApp {
         theme::install_fonts(&cc.egui_ctx);
         let (api_tx, api_rx) = channel();
         let (photo_tx, photo_rx) = channel();
+        let place = cfg.corner;
         let mut app = MotivatorApp {
             cfg,
             dirty_since: None,
+            place,
+            avatar_rect: None,
+            drag_grab: None,
             panel: None,
             tab: Tab::Friend,
             bubble: None,
@@ -121,6 +135,13 @@ impl MotivatorApp {
 
     fn pal(&self) -> &'static Palette {
         theme::palette(self.cfg.theme)
+    }
+
+    fn placement(&self, monitor: Option<Vec2>) -> Corner {
+        match (self.cfg.pos, monitor) {
+            (Some((x, y)), Some(m)) if m.x > 1.0 && m.y > 1.0 => quadrant(Pos2::new(x, y), m),
+            _ => self.cfg.corner,
+        }
     }
 
     fn active_idx(&self) -> usize {
@@ -578,14 +599,25 @@ impl MotivatorApp {
         } else {
             vec2(px, px + 2.0)
         };
-        let (rect, resp) = ui.allocate_exact_size(alloc, Sense::click());
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let (rect, resp) = ui.allocate_exact_size(alloc, Sense::click_and_drag());
+        let cursor = if resp.dragged() {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::PointingHand
+        };
+        let resp = resp.on_hover_cursor(cursor);
         let _ = name;
         let lift = if resp.hovered() { 2.0 } else { 0.0 };
         let tile = Rect::from_min_size(
             Pos2::new(rect.center().x - px / 2.0, rect.max.y - px - lift),
             vec2(px, px),
         );
+        // anchor on the lift-free tile so hover doesn't jiggle the window
+        let anchor = Rect::from_min_size(
+            Pos2::new(rect.center().x - px / 2.0, rect.max.y - px),
+            vec2(px, px),
+        );
+        self.avatar_rect = Some(anchor);
         let rounding = CornerRadius::same((px * 0.22) as u8);
 
         // talking animation offsets
@@ -661,6 +693,33 @@ impl MotivatorApp {
         }
         let _ = hover_id;
 
+        // drag the friend anywhere on screen; the window follows the stored
+        // position in anchor_window. Screen-space pointer = window origin +
+        // window-local pointer — a plain drag delta reads ~0 because the
+        // window moves with the mouse.
+        let origin = ui.ctx().input(|i| i.viewport().inner_rect.map(|r| r.min));
+        if resp.drag_started() {
+            if origin.is_some() {
+                self.drag_grab = resp.interact_pointer_pos().map(|p| p - anchor.center());
+            } else {
+                // native Wayland never reports the window position — hand the
+                // move to the compositor instead (position won't persist)
+                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+        }
+        if resp.dragged() {
+            if let (Some(grab), Some(o), Some(p)) =
+                (self.drag_grab, origin, resp.interact_pointer_pos())
+            {
+                let center = o + p.to_vec2() - grab;
+                self.cfg.pos = Some((center.x, center.y));
+                self.mark_dirty();
+            }
+        }
+        if resp.drag_stopped() {
+            self.drag_grab = None;
+        }
+
         if resp.clicked() {
             self.speak();
         }
@@ -672,7 +731,7 @@ impl MotivatorApp {
     }
 
     fn avatar_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let right = self.cfg.corner.is_right();
+        let right = self.place.is_right();
         let layout = if right {
             Layout::right_to_left(Align::BOTTOM)
         } else {
@@ -1334,18 +1393,29 @@ impl MotivatorApp {
         ui.horizontal(|ui| {
             ui.label(self.label_text("corner"));
             let mut corner = self.cfg.corner;
+            let current = if self.cfg.pos.is_some() {
+                "custom (dragged)".to_string()
+            } else {
+                corner.label().to_string()
+            };
+            let mut snapped = None;
             egui::ComboBox::from_id_salt("corner")
-                .selected_text(RichText::new(corner.label()).font(theme::font_ui()))
+                .selected_text(RichText::new(current).font(theme::font_ui()))
                 .show_ui(ui, |ui| {
                     for c in Corner::ALL {
-                        ui.selectable_value(&mut corner, c, c.label());
+                        if ui.selectable_value(&mut corner, c, c.label()).clicked() {
+                            snapped = Some(c);
+                        }
                     }
                 });
-            if corner != self.cfg.corner {
-                self.cfg.corner = corner;
+            // picking a corner snaps back from a dragged position
+            if let Some(c) = snapped {
+                self.cfg.corner = c;
+                self.cfg.pos = None;
                 self.mark_dirty();
             }
         });
+        ui.label(self.label_text("drag the friend to place it anywhere"));
         let size_label = self.label_text("size");
         if ui
             .add(
@@ -1455,7 +1525,7 @@ impl MotivatorApp {
             Some(Panel::Config) => app.config_panel(ui, ctx),
             None => {}
         };
-        if self.cfg.corner.is_bottom() {
+        if self.place.is_bottom() {
             panel(self, ui);
             self.bubble_ui(ui);
             self.avatar_row(ui, ctx);
@@ -1473,9 +1543,17 @@ impl MotivatorApp {
         if changed {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(desired));
         }
-        let monitor = ctx.input(|i| i.viewport().monitor_size);
-        if let Some(m) = monitor {
-            if m.x > 1.0 && m.y > 1.0 {
+        let Some(m) = ctx.input(|i| i.viewport().monitor_size) else {
+            return;
+        };
+        if m.x <= 1.0 || m.y <= 1.0 {
+            return;
+        }
+        // a dragged friend anchors the window on the avatar tile, so bubbles
+        // and panels grow around it; otherwise pin to the configured corner
+        let target = match (self.cfg.pos, self.avatar_rect) {
+            (Some((x, y)), Some(avatar)) => Pos2::new(x, y) - avatar.center().to_vec2(),
+            _ => {
                 let x = if self.cfg.corner.is_right() {
                     m.x - desired.x - SCREEN_MARGIN + PAD
                 } else {
@@ -1486,12 +1564,14 @@ impl MotivatorApp {
                 } else {
                     SCREEN_MARGIN - PAD
                 };
-                let pos = Pos2::new(x.max(0.0), y.max(0.0));
-                let last = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
-                if changed || last.is_none_or(|l| (l - pos).abs().max_elem() > 2.0) {
-                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
-                }
+                Pos2::new(x, y)
             }
+        };
+        let pos = clamp_to_monitor(target, desired, m);
+        let last = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
+        let dragging = self.drag_grab.is_some();
+        if dragging || changed || last.is_none_or(|l| (l - pos).abs().max_elem() > 2.0) {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
         }
     }
 }
@@ -1548,6 +1628,23 @@ fn interval_label(secs: u64) -> String {
         .find(|(s, _)| *s == secs)
         .map(|(_, l)| l.to_string())
         .unwrap_or_else(|| format!("every {}s", secs))
+}
+
+/// which screen quadrant a point sits in — drives where bubbles/panels open
+fn quadrant(pos: Pos2, monitor: Vec2) -> Corner {
+    match (pos.x > monitor.x / 2.0, pos.y > monitor.y / 2.0) {
+        (true, true) => Corner::BottomRight,
+        (false, true) => Corner::BottomLeft,
+        (true, false) => Corner::TopRight,
+        (false, false) => Corner::TopLeft,
+    }
+}
+
+fn clamp_to_monitor(pos: Pos2, size: Vec2, monitor: Vec2) -> Pos2 {
+    Pos2::new(
+        pos.x.clamp(0.0, (monitor.x - size.x).max(0.0)),
+        pos.y.clamp(0.0, (monitor.y - size.y).max(0.0)),
+    )
 }
 
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -1607,8 +1704,8 @@ impl eframe::App for MotivatorApp {
         self.drain_events();
         self.tick_timers();
 
-        let corner = self.cfg.corner;
-        let layout = if corner.is_right() {
+        self.place = self.placement(ctx.input(|i| i.viewport().monitor_size));
+        let layout = if self.place.is_right() {
             Layout::top_down(Align::Max)
         } else {
             Layout::top_down(Align::Min)
@@ -1729,5 +1826,57 @@ mod tests {
     fn interval_labels() {
         assert_eq!(interval_label(3600), "every hour");
         assert_eq!(interval_label(42), "every 42s");
+    }
+
+    #[test]
+    fn quadrant_maps_screen_halves_to_corners() {
+        let m = vec2(1920.0, 1080.0);
+        assert!(matches!(
+            quadrant(Pos2::new(1800.0, 1000.0), m),
+            Corner::BottomRight
+        ));
+        assert!(matches!(
+            quadrant(Pos2::new(100.0, 1000.0), m),
+            Corner::BottomLeft
+        ));
+        assert!(matches!(
+            quadrant(Pos2::new(1800.0, 80.0), m),
+            Corner::TopRight
+        ));
+        assert!(matches!(
+            quadrant(Pos2::new(100.0, 80.0), m),
+            Corner::TopLeft
+        ));
+        // dead center counts as top-left (not-greater-than on both axes)
+        assert!(matches!(
+            quadrant(Pos2::new(960.0, 540.0), m),
+            Corner::TopLeft
+        ));
+    }
+
+    #[test]
+    fn clamp_keeps_window_on_screen() {
+        let m = vec2(1920.0, 1080.0);
+        let size = vec2(330.0, 420.0);
+        // interior position untouched
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(500.0, 300.0), size, m),
+            Pos2::new(500.0, 300.0)
+        );
+        // hanging off bottom-right gets pulled back in
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(1800.0, 1000.0), size, m),
+            Pos2::new(1920.0 - 330.0, 1080.0 - 420.0)
+        );
+        // negative coords clamp to the origin
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(-40.0, -12.0), size, m),
+            Pos2::ZERO
+        );
+        // window larger than the monitor pins to the origin instead of NaN/flip
+        assert_eq!(
+            clamp_to_monitor(Pos2::new(10.0, 10.0), vec2(4000.0, 4000.0), m),
+            Pos2::ZERO
+        );
     }
 }
