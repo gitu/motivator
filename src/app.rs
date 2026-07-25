@@ -18,14 +18,14 @@ const PAD: f32 = 16.0;
 const SCREEN_MARGIN: f32 = 24.0;
 const SPEAK_SECS: f32 = 1.7;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Panel {
     Chat,
     Friends,
     Config,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
     Friend,
     Quotes,
@@ -85,9 +85,16 @@ pub struct MotivatorApp {
 impl MotivatorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
         theme::install_fonts(&cc.egui_ctx);
+        let mut app = Self::from_config(cfg);
+        // greet with the first line in rotation, like the design's initial bubble
+        app.speak();
+        app
+    }
+
+    fn from_config(cfg: Config) -> Self {
         let (api_tx, api_rx) = channel();
         let (photo_tx, photo_rx) = channel();
-        let mut app = MotivatorApp {
+        MotivatorApp {
             cfg,
             dirty_since: None,
             panel: None,
@@ -113,10 +120,7 @@ impl MotivatorApp {
             photo_tx,
             textures: HashMap::new(),
             last_applied_theme: None,
-        };
-        // greet with the first line in rotation, like the design's initial bubble
-        app.speak();
-        app
+        }
     }
 
     fn pal(&self) -> &'static Palette {
@@ -500,22 +504,6 @@ impl MotivatorApp {
             })
     }
 
-    fn chip(&self, ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
-        let pal = self.pal();
-        let (bg, fg) = if active {
-            (pal.accent, pal.foreground)
-        } else {
-            (pal.card, pal.muted_fg)
-        };
-        let resp = ui.add(
-            egui::Button::new(RichText::new(label).font(theme::font_label()).color(fg))
-                .fill(bg)
-                .stroke(Stroke::new(1.0_f32, pal.border))
-                .corner_radius(CornerRadius::same(20)),
-        );
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-    }
-
     fn mini_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, px: f32) {
         let pal = self.pal();
         let f = &self.cfg.friends[idx];
@@ -664,11 +652,26 @@ impl MotivatorApp {
         if resp.clicked() {
             self.speak();
         }
+        let mut open: Option<Panel> = None;
         resp.context_menu(|ui| {
+            for (panel, label) in [
+                (Panel::Chat, "chat"),
+                (Panel::Friends, "friends"),
+                (Panel::Config, "config"),
+            ] {
+                if ui.button(label).clicked() {
+                    open = Some(panel);
+                    ui.close();
+                }
+            }
+            ui.separator();
             if ui.button("quit motivator").clicked() {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
             }
         });
+        if let Some(panel) = open {
+            self.panel = Some(panel);
+        }
     }
 
     fn avatar_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -681,17 +684,6 @@ impl MotivatorApp {
         ui.with_layout(layout, |ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             self.draw_avatar(ui, ctx);
-            ui.add_space(4.0);
-            for (panel, label) in [
-                (Panel::Config, "config"),
-                (Panel::Friends, "friends"),
-                (Panel::Chat, "chat"),
-            ] {
-                let active = self.panel == Some(panel);
-                if self.chip(ui, label, active).clicked() {
-                    self.panel = if active { None } else { Some(panel) };
-                }
-            }
         });
     }
 
@@ -1684,6 +1676,18 @@ mod tests {
         pool.iter().map(|q| q.t.clone()).collect()
     }
 
+    fn app() -> MotivatorApp {
+        MotivatorApp::from_config(Config::default())
+    }
+
+    fn bubble(text: &str) -> Bubble {
+        Bubble {
+            text: text.into(),
+            tag: "",
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
     #[test]
     fn rotation_respects_weights_and_expansion() {
         // expansion off: only unmuted sample lines rotate
@@ -1729,5 +1733,113 @@ mod tests {
     fn interval_labels() {
         assert_eq!(interval_label(3600), "every hour");
         assert_eq!(interval_label(42), "every 42s");
+    }
+
+    #[test]
+    fn interface_hidden_by_default() {
+        let app = app();
+        assert!(app.panel.is_none(), "no panel may be open on startup");
+        assert!(app.bubble.is_none(), "greeting only happens via new()");
+    }
+
+    #[test]
+    fn pick_quote_avoids_repeating_current_bubble() {
+        let mut app = app();
+        app.active_mut().quotes = vec![Quote::sample("one"), Quote::sample("two")];
+        app.bubble = Some(bubble("one"));
+        for _ in 0..20 {
+            let (t, _) = app.pick_quote().expect("pool is non-empty");
+            assert_eq!(t, "two");
+        }
+    }
+
+    #[test]
+    fn speak_sets_bubble_and_talking_animation() {
+        let mut app = app();
+        app.speak();
+        assert!(app.bubble.is_some());
+        assert!(app.speak_start.is_some());
+    }
+
+    #[test]
+    fn react_down_mutes_and_notes() {
+        let mut app = app();
+        app.active_mut().quotes = vec![Quote::sample("go")];
+        app.bubble = Some(bubble("go"));
+        app.react(-1);
+        assert_eq!(app.active().quotes[0].w, 0);
+        let (note, _) = app.note.as_ref().expect("mute note shown");
+        assert!(note.contains("muted"), "note={note}");
+    }
+
+    #[test]
+    fn pick_friend_switches_resets_and_closes_panel() {
+        let mut app = app();
+        app.panel = Some(Panel::Chat);
+        app.chat.push(ChatMsg {
+            me: true,
+            t: "hi".into(),
+        });
+        app.pick_friend("ana");
+        assert_eq!(app.cfg.active, "ana");
+        assert!(app.panel.is_none(), "panel closes after switching");
+        assert!(app.chat.is_empty(), "chat history belongs to one friend");
+        assert!(app.bubble.is_some(), "new friend greets right away");
+    }
+
+    #[test]
+    fn pick_same_friend_only_closes_panel() {
+        let mut app = app();
+        app.panel = Some(Panel::Friends);
+        let before = app.cfg.active.clone();
+        app.pick_friend(&before);
+        assert_eq!(app.cfg.active, before);
+        assert!(app.panel.is_none());
+    }
+
+    #[test]
+    fn add_friend_opens_config_panel() {
+        let mut app = app();
+        let n = app.cfg.friends.len();
+        app.add_friend();
+        assert_eq!(app.cfg.friends.len(), n + 1);
+        assert_eq!(app.cfg.active, app.cfg.friends[n].id);
+        assert_eq!(app.panel, Some(Panel::Config), "jump straight to setup");
+        assert_eq!(app.tab, Tab::Friend);
+    }
+
+    #[test]
+    fn del_friend_reassigns_active_and_keeps_last() {
+        let mut app = app();
+        let first = app.cfg.friends[0].id.clone();
+        app.pick_friend(&first);
+        app.del_friend(&first);
+        assert!(app.cfg.friends.iter().all(|f| f.id != first));
+        assert_eq!(app.cfg.active, app.cfg.friends[0].id);
+        while app.cfg.friends.len() > 1 {
+            let id = app.cfg.friends[0].id.clone();
+            app.del_friend(&id);
+        }
+        let last = app.cfg.friends[0].id.clone();
+        app.del_friend(&last);
+        assert_eq!(app.cfg.friends.len(), 1, "the last friend is undeletable");
+    }
+
+    #[test]
+    fn canned_reply_never_empty() {
+        let mut app = app();
+        app.active_mut().quotes.clear();
+        for _ in 0..20 {
+            assert!(!app.canned_reply().is_empty());
+        }
+    }
+
+    #[test]
+    fn mix_blends_endpoints() {
+        let a = Color32::from_rgb(0, 0, 0);
+        let b = Color32::from_rgb(200, 100, 50);
+        assert_eq!(mix(a, b, 0.0), a);
+        assert_eq!(mix(a, b, 1.0), b);
+        assert_eq!(mix(a, b, 0.5), Color32::from_rgb(100, 50, 25));
     }
 }
