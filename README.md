@@ -36,10 +36,12 @@ actually say — with a little talking animation. Teach it which lines land with
 - **schedule** — time windows that hand the widget to a different friend:
   the work friend 09:00–17:00 on workdays, the coach over lunch, the
   wind-down friend in the evening; overlaps resolve to the shortest window
-- **photo avatars** — upload a photo; the background is removed automatically
-  (flood fill from the borders) and the mouth is located by real face
-  detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
-  fallback) so the head's top half can flap while talking, jaw-snap style
+- **photo avatars** — upload a photo; the subject — face, hair, upper body —
+  is cut out automatically by an embedded U²-Netp matting model (pure-Rust
+  tract inference; the soft matte keeps single hair strands, works on busy
+  backgrounds) and the mouth is located by real face detection (embedded
+  SeetaFace model, pure Rust — silhouette heuristic as fallback) so the
+  head's top half can flap while talking, jaw-snap style
 - **friend cards** — share a friend as a PNG with their whole config (quotes,
   weights, photo, behavior) embedded in the pixels; copy/paste or send as a
   file, import via friends → paste card
@@ -193,4 +195,12 @@ native-Wayland — then use your compositor's window rules to pin the widget
 [MIT](LICENSE). The embedded face-detection model
 (`assets/seeta_fd_frontal_v1.0.bin`) is the SeetaFace frontal model by the
 VIPL group (ICT, Chinese Academy of Sciences), BSD-2-Clause, via the
-[rustface](https://github.com/atomashpolskiy/rustface) project.
+[rustface](https://github.com/atomashpolskiy/rustface) project. The embedded
+cut-out model (`assets/u2netp.onnx`) is
+[U²-Netp](https://github.com/xuebinqin/U-2-Net) by Qin et al., Apache-2.0,
+via the [rembg](https://github.com/danielgatis/rembg) project — lightly
+patched for [tract](https://github.com/sonos/tract): dynamic `Resize` sizes
+replaced with the equivalent constant scales, graph pre-simplified with
+onnxsim (numerically identical output). The test fixture
+(`tests/fixtures/stylegan2_face.jpg`) is the same public-domain StyleGAN2
+portrait as the demo avatar.
