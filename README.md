@@ -47,9 +47,7 @@ brew install --cask gitu/tap/motivator
 ```
 
 The cask puts `motivator` on your PATH and clears the quarantine flag during
-install (builds are unsigned) — start it from a terminal with `motivator`.
-If Gatekeeper still complains, clear the flag yourself:
-`xattr -d com.apple.quarantine "$(which motivator)"`.
+install — start it from a terminal with `motivator`.
 
 macOS / Linux, via install script (installs to `~/.local/bin`):
 
@@ -64,10 +62,11 @@ irm https://raw.githubusercontent.com/gitu/motivator/main/scripts/install.ps1 | 
 ```
 
 Or grab a binary from the [latest release](https://github.com/gitu/motivator/releases)
-(`.tar.gz` for macOS / Linux, `.zip` for Windows), unpack, run. Builds are
-unsigned — on macOS clear the quarantine flag first:
-`xattr -d com.apple.quarantine motivator` (the cask and install script do
-this for you).
+(`.tar.gz` for macOS / Linux, `.zip` for Windows), unpack, run.
+
+Builds are currently unsigned. On macOS the first run needs the quarantine
+flag cleared (`xattr -d com.apple.quarantine motivator` — the cask and
+install script do this for you); on Windows, allow the SmartScreen prompt.
 
 Or build from source:
 
