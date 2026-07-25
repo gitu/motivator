@@ -75,7 +75,9 @@ with stretched lip pixels, so the mouth really opens instead of showing a
 slice. *flap* is the old-school jaw-snap. Correct the hinge with the *mouth
 line* slider if the detector guessed wrong. *swap* alternates with a second
 mouth-open still — upload one, or press **✨ generate with ai** to have the
-configured endpoint's image API (`gpt-image-1`) make one from the photo.
+configured endpoint's image API (`gpt-image-1`) make one from the photo;
+the open mouth in the gif above was generated exactly that way
+(`motivator --talkframe <cutout.png> <friend-id>` is the headless twin).
 
 Idle animations run continuously, and friends with a detected eye band
 blink every few seconds (with the occasional double blink — toggle per

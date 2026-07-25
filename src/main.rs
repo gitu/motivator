@@ -43,6 +43,33 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    // `motivator --talkframe <cutout.png> <friend-id>` asks the configured
+    // image API for a mouth-open frame and stores it as {id}.talk — the
+    // headless twin of the "✨ generate with ai" button
+    if args.get(1).is_some_and(|a| a == "--talkframe") {
+        let usage = "usage: --talkframe <cutout.png> <friend-id>";
+        let (src, id) = (args.get(2).expect(usage), args.get(3).expect(usage));
+        let cfg = config::Config::load();
+        let result = std::fs::read(src)
+            .map_err(|e| e.to_string())
+            .and_then(|png| api::talk_frame(&cfg.api, &png))
+            .and_then(|png| {
+                photo::process_and_store_bytes(
+                    &png,
+                    Some("png"),
+                    &format!("{id}.talk"),
+                    config::PhotoMode::Auto,
+                )
+            });
+        match result {
+            Ok(p) => println!("ok {}", p.path.display()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     // `motivator --share <friend-id> <out.png>` / `--import <card.png>` run the
     // friend-card codec headless — useful for scripting/debugging shares
     if args.get(1).is_some_and(|a| a == "--share") {
