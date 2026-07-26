@@ -160,16 +160,6 @@ pub enum QuoteSrc {
     New,
 }
 
-impl QuoteSrc {
-    pub fn tag(self) -> &'static str {
-        match self {
-            QuoteSrc::Sample => "sample",
-            QuoteSrc::Auto => "auto",
-            QuoteSrc::New => "ai",
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Expansion {
@@ -263,6 +253,14 @@ pub struct Friend {
     /// blink now and then — needs a photo with a detected eye band
     #[serde(default = "default_true")]
     pub blink: bool,
+    /// who they are and how they talk — feeds the chat prompt and quote
+    /// generation alongside the sample quotes
+    #[serde(default)]
+    pub persona: String,
+    /// custom chat system prompt; empty = built-in template. Supports
+    /// {name}, {description} and {quotes} placeholders.
+    #[serde(default)]
+    pub chat_prompt: String,
     pub accent: Accent,
     pub quotes: Vec<Quote>,
     /// canned fallback lines used by "remix" expansion when no AI is configured
@@ -440,6 +438,8 @@ fn default_friends() -> Vec<Friend> {
             talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
+            persona: "blunt tech-lead energy — deadlines over feelings, allergic to excuses".into(),
+            chat_prompt: String::new(),
             accent: Accent::Orange,
             quotes: vec![
                 Quote::sample("Do your fucking job."),
@@ -463,6 +463,8 @@ fn default_friends() -> Vec<Friend> {
             talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
+            persona: "gentle and grounding — small steps, self-care, never guilt-trips".into(),
+            chat_prompt: String::new(),
             accent: Accent::Lime,
             quotes: vec![
                 Quote::sample("you've got this — one thing at a time."),
@@ -485,6 +487,8 @@ fn default_friends() -> Vec<Friend> {
             talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
+            persona: "no-nonsense trainer — discipline, reps, earned rest".into(),
+            chat_prompt: String::new(),
             accent: Accent::Violet,
             quotes: vec![
                 Quote::sample("five more minutes of focus."),
@@ -586,9 +590,12 @@ mod tests {
             pos: Some((120.5, 640.0)),
             ..Default::default()
         };
+        cfg.friends[0].chat_prompt = "you are {name}: {description}".into();
         cfg.api.max_tokens = 512;
         cfg.api.token_param = TokenParam::MaxCompletionTokens;
         let back = cfg.roundtrip();
+        assert_eq!(back.friends[0].persona, cfg.friends[0].persona);
+        assert_eq!(back.friends[0].chat_prompt, "you are {name}: {description}");
         assert_eq!(back.api.max_tokens, 512);
         assert_eq!(back.api.token_param, TokenParam::MaxCompletionTokens);
         assert_eq!(back.friends.len(), cfg.friends.len());
@@ -697,6 +704,9 @@ mod tests {
         assert_eq!(cfg.api.token_param, TokenParam::Auto);
         assert_eq!(cfg.pos, None);
         assert!(cfg.friends[0].pool.is_empty());
+        // persona / chat prompt arrived later: old configs load with them empty
+        assert!(cfg.friends[0].persona.is_empty());
+        assert!(cfg.friends[0].chat_prompt.is_empty());
         assert!(cfg.friends[0].photo.is_none());
         assert_eq!(cfg.friends[0].photo_mode, PhotoMode::Auto);
         assert_eq!(cfg.friends[0].talk_anim, TalkAnim::Jaw);

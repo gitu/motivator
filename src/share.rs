@@ -34,6 +34,12 @@ pub struct SharedFriend {
     pub name: String,
     pub accent: Accent,
     pub split: f32,
+    /// both prompt fields arrived after card v1 — older cards default them
+    /// to empty, older apps ignore the extra keys
+    #[serde(default)]
+    pub persona: String,
+    #[serde(default)]
+    pub chat_prompt: String,
     pub quotes: Vec<Quote>,
     pub pool: Vec<String>,
     pub expansion: Expansion,
@@ -57,6 +63,8 @@ pub fn encode_card(friend: &Friend, accent: [u8; 3]) -> Result<RgbaImage, String
         name: friend.name.clone(),
         accent: friend.accent,
         split: friend.photo.as_ref().map_or(0.52, |p| p.split),
+        persona: friend.persona.clone(),
+        chat_prompt: friend.chat_prompt.clone(),
         quotes: friend.quotes.clone(),
         pool: friend.pool.clone(),
         expansion: friend.expansion,
@@ -158,6 +166,8 @@ pub fn import_into(
         talk_anim: crate::config::TalkAnim::Jaw,
         idle_anim: crate::config::IdleAnim::Off,
         blink: true,
+        persona: s.persona,
+        chat_prompt: s.chat_prompt,
         accent: s.accent,
         quotes,
         pool: s.pool,
@@ -304,6 +314,8 @@ mod tests {
             talk_anim: crate::config::TalkAnim::Flap,
             idle_anim: crate::config::IdleAnim::Off,
             blink: true,
+            persona: "upbeat, terse".into(),
+            chat_prompt: "be {name}".into(),
             accent: Accent::Cyan,
             quotes: vec![
                 Quote::sample("go"),
@@ -326,6 +338,8 @@ mod tests {
         let (s, photo) = decode_card(&card).unwrap();
         assert_eq!(s.name, "test pal");
         assert!(matches!(s.accent, Accent::Cyan));
+        assert_eq!(s.persona, "upbeat, terse");
+        assert_eq!(s.chat_prompt, "be {name}");
         assert_eq!(s.quotes.len(), 2);
         assert_eq!(s.quotes[1].w, 4);
         assert_eq!(s.pool, vec!["small steps".to_string()]);
@@ -357,10 +371,12 @@ mod tests {
             keys,
             vec![
                 "accent",
+                "chat_prompt",
                 "expansion",
                 "interval_secs",
                 "name",
                 "nudges",
+                "persona",
                 "pool",
                 "quotes",
                 "split"
@@ -477,6 +493,8 @@ mod tests {
             name: String::new(),
             accent: Accent::Pink,
             split: f32::NAN,
+            persona: "cheerful".into(),
+            chat_prompt: String::new(),
             quotes: vec![Quote {
                 t: "hi".into(),
                 src: QuoteSrc::Sample,
@@ -498,6 +516,7 @@ mod tests {
         assert_eq!(cfg.active, id);
         let f = cfg.friends.last().unwrap();
         assert_eq!(f.name, "friend");
+        assert_eq!(f.persona, "cheerful");
         assert_eq!(f.photo.as_ref().unwrap().split, 0.52);
         assert_eq!(f.quotes[0].w, 5);
         assert_eq!(f.interval_secs, 5);

@@ -62,7 +62,6 @@ struct AvatarTex {
 
 struct Bubble {
     text: String,
-    tag: &'static str,
     deadline: Instant,
 }
 
@@ -118,6 +117,8 @@ pub struct MotivatorApp {
     chat_err: Option<String>,
 
     new_quote: String,
+    /// advanced chat-prompt editor unfolded in the friend tab
+    show_prompt: bool,
     gen_note: String,
     gen_busy: bool,
     api_note: String,
@@ -191,6 +192,7 @@ impl MotivatorApp {
             pending_reply: None,
             chat_err: None,
             new_quote: String::new(),
+            show_prompt: false,
             gen_note: String::new(),
             gen_busy: false,
             api_note: String::new(),
@@ -269,22 +271,20 @@ impl MotivatorApp {
             .collect()
     }
 
-    fn pick_quote(&self) -> Option<(String, &'static str)> {
+    fn pick_quote(&self) -> Option<String> {
         let f = self.active();
         let pool = Self::rotation(f);
         let current = self.bubble.as_ref().map(|b| b.text.as_str());
-        pick_from(&pool, current).map(|q| (q.t.clone(), q.src.tag()))
+        pick_from(&pool, current).map(|q| q.t.clone())
     }
 
     fn speak(&mut self) {
-        let (text, tag) = self.pick_quote().unwrap_or((
-            "(no lines in rotation — add some in config → quotes)".into(),
-            "",
-        ));
+        let text = self
+            .pick_quote()
+            .unwrap_or_else(|| "(no lines in rotation — add some in config → quotes)".into());
         self.note = None;
         self.bubble = Some(Bubble {
             text,
-            tag,
             deadline: Instant::now() + Duration::from_secs_f32(self.cfg.bubble_secs.max(2.0)),
         });
         self.speak_start = Some(Instant::now());
@@ -432,6 +432,8 @@ impl MotivatorApp {
             talk_anim: TalkAnim::Jaw,
             idle_anim: IdleAnim::Off,
             blink: true,
+            persona: String::new(),
+            chat_prompt: String::new(),
             accent,
             quotes: Vec::new(),
             pool: Vec::new(),
@@ -1338,7 +1340,6 @@ impl MotivatorApp {
         let name = self.active().name.clone();
         let accent = pal.accent_color(self.active().accent);
         let text = bubble.text.clone();
-        let tag = bubble.tag;
         let note = self.note.as_ref().map(|(n, _)| n.clone());
 
         let mut dismiss = false;
@@ -1358,13 +1359,7 @@ impl MotivatorApp {
                                 .font(theme::font_label())
                                 .color(accent),
                         );
-                        let meta = note.unwrap_or_else(|| {
-                            if tag.is_empty() {
-                                String::new()
-                            } else {
-                                format!("· {tag}")
-                            }
-                        });
+                        let meta = note.unwrap_or_default();
                         ui.label(
                             RichText::new(meta)
                                 .font(theme::font_label())
@@ -1908,6 +1903,52 @@ impl MotivatorApp {
             self.active_mut().name = name;
         }
         ui.label(
+            RichText::new("description")
+                .font(theme::font_ui())
+                .color(pal.foreground),
+        );
+        let mut persona = self.active().persona.clone();
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut persona)
+                    .hint_text("who they are, how they talk — drives chat + generation")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            self.active_mut().persona = persona;
+        }
+        let arrow = if self.show_prompt { "▾" } else { "▸" };
+        if self
+            .tiny_button(ui, &format!("{arrow} advanced: chat prompt"))
+            .clicked()
+        {
+            self.show_prompt = !self.show_prompt;
+        }
+        if self.show_prompt {
+            let mut prompt = self.active().chat_prompt.clone();
+            if ui
+                .add(
+                    egui::TextEdit::multiline(&mut prompt)
+                        .hint_text("empty = built-in prompt from name, description and quotes")
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY),
+                )
+                .changed()
+            {
+                self.active_mut().chat_prompt = prompt;
+            }
+            ui.label(self.label_text(
+                "replaces the built-in chat prompt — {name}, {description} and {quotes} are filled in",
+            ));
+            if !self.active().chat_prompt.is_empty()
+                && self.tiny_button(ui, "reset to default").clicked()
+            {
+                self.active_mut().chat_prompt.clear();
+            }
+        }
+        ui.label(
             RichText::new("accent")
                 .font(theme::font_ui())
                 .color(pal.foreground),
@@ -1983,14 +2024,14 @@ impl MotivatorApp {
             .show(ui, |ui| {
                 ui.set_width(294.0);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let quotes: Vec<(usize, String, &'static str, bool)> = self
+                let quotes: Vec<(usize, String, bool)> = self
                     .active()
                     .quotes
                     .iter()
                     .enumerate()
-                    .map(|(i, q)| (i, q.t.clone(), q.src.tag(), q.w > 0))
+                    .map(|(i, q)| (i, q.t.clone(), q.w > 0))
                     .collect();
-                for (i, t, tag, live) in quotes {
+                for (i, t, live) in quotes {
                     ui.horizontal(|ui| {
                         let mut rt = RichText::new(&t)
                             .font(FontId::new(12.5, FontFamily::Proportional))
@@ -2010,7 +2051,6 @@ impl MotivatorApp {
                             if self.tiny_button(ui, "×").clicked() {
                                 remove = Some(i);
                             }
-                            ui.label(self.label_text(tag));
                         });
                     });
                     hline(ui, pal, 290.0);
@@ -2826,6 +2866,8 @@ mod tests {
             talk_anim: TalkAnim::Flap,
             idle_anim: IdleAnim::Off,
             blink: true,
+            persona: String::new(),
+            chat_prompt: String::new(),
             accent: Accent::Orange,
             quotes: vec![
                 Quote {
@@ -2867,7 +2909,6 @@ mod tests {
     fn bubble(text: &str) -> Bubble {
         Bubble {
             text: text.into(),
-            tag: "",
             deadline: Instant::now() + Duration::from_secs(5),
         }
     }
@@ -3121,7 +3162,7 @@ mod tests {
         app.active_mut().quotes = vec![Quote::sample("one"), Quote::sample("two")];
         app.bubble = Some(bubble("one"));
         for _ in 0..20 {
-            let (t, _) = app.pick_quote().expect("pool is non-empty");
+            let t = app.pick_quote().expect("pool is non-empty");
             assert_eq!(t, "two");
         }
     }

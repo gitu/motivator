@@ -29,8 +29,12 @@ actually say — with a little talking animation. Teach it which lines land with
 - **quote learning** — ↑ more / ↓ less weights each line (0 = muted, never
   repeats); rotation is weighted random, never repeating the current line
 - **chat** — talk to your friend; replies come from an OpenAI-compatible
-  endpoint in *their* voice (learned from their sample lines), with canned
-  fallbacks when no endpoint is configured or the call fails
+  endpoint in *their* voice (built from their description and sample lines),
+  with canned fallbacks when no endpoint is configured or the call fails
+- **persona** — each friend has a free-text description that drives chat and
+  quote generation (works even with no sample lines yet); an advanced
+  per-friend chat-prompt override gives full control, and both travel inside
+  shared friend cards
 - **friends roster** — multiple friends, each with their own lines, accent
   color, photo, and nudge schedule
 - **schedule** — time windows that hand the widget to a different friend:
