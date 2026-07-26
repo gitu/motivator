@@ -125,6 +125,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false)
             .with_transparent(true)
+            // macOS draws its own window shadow around the opaque content,
+            // which shows up as an extra border + translucent halo on the
+            // panels (no-op elsewhere)
+            .with_has_shadow(false)
             .with_always_on_top()
             .with_resizable(false)
             .with_taskbar(false)

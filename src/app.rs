@@ -19,7 +19,7 @@ use crate::schedule;
 use crate::share;
 use crate::theme::{self, Palette};
 
-/// margin inside the (transparent) window so panel shadows aren't clipped
+/// margin inside the (transparent) window around the panel stack
 const PAD: f32 = 16.0;
 /// gap between the widget and the screen edge
 const SCREEN_MARGIN: f32 = 24.0;
@@ -904,6 +904,22 @@ impl MotivatorApp {
         )
     }
 
+    /// close × for panels/bubbles — larger than tiny_button so it's easier
+    /// to spot and hit
+    fn close_button(&self, ui: &mut egui::Ui) -> egui::Response {
+        let pal = self.pal();
+        ui.add(
+            egui::Button::new(
+                RichText::new("×")
+                    .font(FontId::new(15.0, FontFamily::Proportional))
+                    .color(pal.muted_fg),
+            )
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
     /// tiny weekday toggle for schedule rows — filled while the day is on
     fn day_toggle(&self, ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
         let pal = self.pal();
@@ -932,12 +948,6 @@ impl MotivatorApp {
             .stroke(Stroke::new(1.0_f32, pal.border))
             .corner_radius(CornerRadius::same(12))
             .inner_margin(Margin::same(14))
-            .shadow(egui::epaint::Shadow {
-                offset: [0, 8],
-                blur: 24,
-                spread: 0,
-                color: Color32::from_black_alpha(pal.shadow_alpha),
-            })
     }
 
     fn mini_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, px: f32) {
@@ -1361,7 +1371,7 @@ impl MotivatorApp {
                                 .color(pal.muted_fg),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            dismiss = self.tiny_button(ui, "×").clicked();
+                            dismiss = self.close_button(ui).clicked();
                         });
                     });
                     ui.label(
@@ -1417,7 +1427,7 @@ impl MotivatorApp {
                             ui.label(self.label_text(&format!("chat — {name}")));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.add_space(8.0);
-                                close = self.tiny_button(ui, "×").clicked();
+                                close = self.close_button(ui).clicked();
                             });
                         },
                     );
@@ -1550,7 +1560,7 @@ impl MotivatorApp {
                         ui.add_space(4.0);
                         ui.label(self.label_text("friends"));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            close = self.tiny_button(ui, "×").clicked();
+                            close = self.close_button(ui).clicked();
                         });
                     });
                     let show_del = self.cfg.friends.len() > 1;
@@ -1675,7 +1685,7 @@ impl MotivatorApp {
                 ui.horizontal(|ui| {
                     ui.label(self.label_text(&format!("config — {name}")));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        close = self.tiny_button(ui, "×").clicked();
+                        close = self.close_button(ui).clicked();
                     });
                 });
                 // segmented tabs
