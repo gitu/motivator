@@ -1,21 +1,29 @@
-//! Photo pipeline: background cut-out (border flood fill against corner
-//! reference colors) and mouth-line estimation for the talking flap.
-//! Direct port of the design's canvas pipeline, extended with explicit
-//! processing modes (auto / pre-cut / raw) and animated-avatar decoding.
+//! Photo pipeline: background cut-out (U²-Netp neural matting via tract for
+//! stills, border flood fill for animation frames) and face-geometry
+//! estimation for the talking warp, with explicit processing modes
+//! (auto / pre-cut / raw) and animated-avatar decoding.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use image::{AnimationDecoder, RgbaImage};
+use tract_onnx::prelude::*;
 
 use crate::config::PhotoMode;
 
 /// SeetaFace frontal detection model (BSD-2, VIPL group / rustface project)
 static FACE_MODEL: &[u8] = include_bytes!("../assets/seeta_fd_frontal_v1.0.bin");
 
+/// U²-Netp salient-object matting model (Apache-2.0, Qin et al. / rembg)
+static MATTE_MODEL: &[u8] = include_bytes!("../assets/u2netp.onnx");
+
+/// U²-Netp input edge length
+const MATTE_SIZE: u32 = 320;
+
 /// animated avatars are bounded so 48 × 256² RGBA stays ~12 MB worst case
 const MAX_FRAMES: usize = 48;
 const ANIM_EDGE: u32 = 256;
-/// cap size for stills: plenty for a <=96px avatar, keeps flood fill cheap
+/// cap size for stills: plenty for a <=96px avatar, keeps the matte cheap
 const STILL_EDGE: u32 = 512;
 /// raw files above this become one resized PNG — a texture has to fit in VRAM
 const RAW_EDGE: u32 = 2048;
@@ -108,7 +116,7 @@ fn process_bytes(
     // the silhouette heuristic is only the no-face-found fallback
     let detected = detect_face(&rgba);
 
-    // pre-cut images (real transparency) skip the flood fill — the alpha
+    // pre-cut images (real transparency) skip the matting — the alpha
     // channel already is the cut-out; "already cut out" mode forces that
     let transparent = rgba.pixels().filter(|p| p[3] < 128).count();
     let heuristic_split = if mode == PhotoMode::Precut
@@ -495,19 +503,112 @@ fn center_on_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) ->
     Some(band_top + best_len as f32 / 2.0)
 }
 
-/// Remove the background by flood-filling from the top/left/right borders,
-/// matching any of four reference colors sampled near the corners/edges.
-/// Returns the mouth split if the cut-out looks plausible, None if the image
-/// was left untouched (removal ratio implausible).
-fn cutout(img: &mut RgbaImage) -> Option<f32> {
-    let refs = sample_refs(img);
-    if !cutout_with_refs(img, &refs) {
+/// Parse the embedded U²-Netp model once; None if tract can't run it
+/// (should not happen — the model ships with the binary).
+fn matte_model() -> Option<&'static TypedSimplePlan<TypedModel>> {
+    static MODEL: OnceLock<Option<TypedSimplePlan<TypedModel>>> = OnceLock::new();
+    MODEL
+        .get_or_init(|| {
+            let s = MATTE_SIZE as i64;
+            tract_onnx::onnx()
+                .model_for_read(&mut std::io::Cursor::new(MATTE_MODEL))
+                .and_then(|m| {
+                    m.with_input_fact(0, InferenceFact::dt_shape(f32::datum_type(), [1, 3, s, s]))
+                })
+                .and_then(|m| m.into_optimized())
+                .and_then(|m| m.into_runnable())
+                .map_err(|e| eprintln!("matting model unavailable: {e:?}"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Run U²-Netp over the photo and return its saliency matte, stretched back
+/// to the photo's size. The soft edge of the matte is what preserves single
+/// hair strands. Returns None when inference fails or the model isn't
+/// confident anything salient is in frame (raw saliency spread too narrow).
+fn matte(img: &RgbaImage) -> Option<image::GrayImage> {
+    let model = matte_model()?;
+    let small = image::imageops::resize(
+        img,
+        MATTE_SIZE,
+        MATTE_SIZE,
+        image::imageops::FilterType::Triangle,
+    );
+    const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+    const STD: [f32; 3] = [0.229, 0.224, 0.225];
+    let n = MATTE_SIZE as usize;
+    let input: Tensor = tract_ndarray::Array4::from_shape_fn((1, 3, n, n), |(_, c, y, x)| {
+        let p = small.get_pixel(x as u32, y as u32);
+        (p[c] as f32 / 255.0 - MEAN[c]) / STD[c]
+    })
+    .into();
+    let result = model
+        .run(tvec!(input.into()))
+        .map_err(|e| eprintln!("matting failed: {e:?}"))
+        .ok()?;
+    let out = result.first()?.to_array_view::<f32>().ok()?;
+
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for &v in out.iter() {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
+        eprintln!("matte: saliency lo={lo:.3} hi={hi:.3}");
+    }
+    // a real subject yields near-0 background and near-1 subject scores; a
+    // narrow spread means the model saw nothing to cut out
+    if hi - lo < 0.5 {
         return None;
     }
+    let gray = image::GrayImage::from_fn(MATTE_SIZE, MATTE_SIZE, |x, y| {
+        let v = out[[0, 0, y as usize, x as usize]];
+        image::Luma([((v - lo) / (hi - lo) * 255.0) as u8])
+    });
+    Some(image::imageops::resize(
+        &gray,
+        img.width(),
+        img.height(),
+        image::imageops::FilterType::Triangle,
+    ))
+}
+
+/// Squash matte noise while keeping soft hair edges: below ~10% saliency is
+/// background, above ~90% is solid subject, linear in between.
+fn remap_alpha(v: u8) -> u8 {
+    const LO: i32 = 26;
+    const HI: i32 = 230;
+    ((v as i32 - LO) * 255 / (HI - LO)).clamp(0, 255) as u8
+}
+
+/// Cut the subject (face, hair, upper body) out of the photo with the
+/// embedded U²-Netp matte. Returns the mouth split if the cut-out looks
+/// plausible, None if the image was left untouched (no confident subject or
+/// implausible coverage).
+fn cutout(img: &mut RgbaImage) -> Option<f32> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < 8 || h < 8 {
+        return None;
+    }
+    let matte = matte(img)?;
+    // a portrait subject covers neither a sliver nor the whole frame
+    let fg = matte.pixels().filter(|p| p[0] > 128).count();
+    if fg < w * h / 20 || fg > w * h * 19 / 20 {
+        return None;
+    }
+    for (p, m) in img.pixels_mut().zip(matte.pixels()) {
+        p[3] = p[3].min(remap_alpha(m[0]));
+    }
+    // stray salient blobs (props, text) — keep only the largest opaque
+    // region, the subject
+    keep_largest_component(img.as_mut(), w, h);
     split_heuristic(img).or(Some(0.52))
 }
 
-/// Background reference colors sampled near the corners/edges.
+/// Background reference colors sampled near the corners/edges. Animation
+/// frames still cut by flood fill: per-frame matting would be slow (up to
+/// 48 frames) and could flicker, while fixed refs stay stable.
 fn sample_refs(img: &RgbaImage) -> Vec<[i32; 3]> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     if w < 8 || h < 8 {
@@ -685,46 +786,41 @@ pub fn split_heuristic(img: &RgbaImage) -> Option<f32> {
 mod tests {
     use super::*;
 
-    /// flat background + head/neck/shoulder silhouette
-    fn portrait() -> RgbaImage {
-        let (w, h) = (64u32, 64u32);
-        let mut img = RgbaImage::from_pixel(w, h, image::Rgba([240, 240, 240, 255]));
-        let skin = image::Rgba([170, 120, 90, 255]);
-        for y in 6..40 {
-            for x in 22..42 {
-                img.put_pixel(x, y, skin); // head
-            }
+    #[test]
+    fn cutout_matte_extracts_face_hair_and_shoulders() {
+        // real (AI-generated, public domain) portrait on a busy blurred
+        // background — the case the old border flood fill could not handle
+        let mut img = image::open("tests/fixtures/stylegan2_face.jpg")
+            .expect("fixture")
+            .resize(512, 512, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        let (w, h) = (img.width(), img.height());
+        let split = cutout(&mut img).expect("subject found");
+        if std::env::var_os("MOTIVATOR_DEBUG_FACE").is_some() {
+            img.save(std::env::temp_dir().join("motivator-matte-debug.png"))
+                .unwrap();
         }
-        for y in 40..50 {
-            for x in 28..36 {
-                img.put_pixel(x, y, skin); // neck
-            }
-        }
-        for y in 50..64 {
-            for x in 6..58 {
-                img.put_pixel(x, y, skin); // shoulders
-            }
-        }
-        img
+        assert_eq!(img.get_pixel(3, 3)[3], 0, "top-left background transparent");
+        assert_eq!(
+            img.get_pixel(w - 4, 3)[3],
+            0,
+            "top-right background transparent"
+        );
+        assert!(
+            img.get_pixel(w / 2, h / 2)[3] > 200,
+            "face must stay opaque"
+        );
+        assert!((0.3..=0.85).contains(&split), "split={split}");
     }
 
     #[test]
-    fn cutout_removes_background_and_finds_mouth() {
-        let mut img = portrait();
-        // a floating "cloud" that the flood fill can't reach (color far from
-        // the background refs) — must be pruned as a disconnected island
-        for y in 2..5 {
-            for x in 4..12 {
-                img.put_pixel(x, y, image::Rgba([90, 200, 60, 255]));
-            }
-        }
-        let split = cutout(&mut img).expect("plausible cut-out");
-        assert_eq!(img.get_pixel(1, 1)[3], 0, "background must be transparent");
-        assert_eq!(img.get_pixel(63, 20)[3], 0);
-        assert!(img.get_pixel(32, 20)[3] > 0, "head must stay opaque");
-        assert_eq!(img.get_pixel(8, 3)[3], 0, "floating island must be pruned");
-        // mouth ≈ 80% from crown (y=6) to neck minimum → around y≈0.5–0.6 of height
-        assert!((0.3..=0.78).contains(&split), "split={split}");
+    fn remap_squashes_noise_and_keeps_soft_middle() {
+        assert_eq!(remap_alpha(0), 0);
+        assert_eq!(remap_alpha(26), 0, "low saliency is background");
+        assert_eq!(remap_alpha(230), 255, "high saliency is solid");
+        assert_eq!(remap_alpha(255), 255);
+        let mid = remap_alpha(128);
+        assert!((100..=160).contains(&mid), "middle stays soft: {mid}");
     }
 
     #[test]
@@ -773,6 +869,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// flat background + head/neck/shoulder silhouette
+    fn portrait() -> RgbaImage {
+        let (w, h) = (64u32, 64u32);
+        let mut img = RgbaImage::from_pixel(w, h, image::Rgba([240, 240, 240, 255]));
+        let skin = image::Rgba([170, 120, 90, 255]);
+        for y in 6..40 {
+            for x in 22..42 {
+                img.put_pixel(x, y, skin); // head
+            }
+        }
+        for y in 40..50 {
+            for x in 28..36 {
+                img.put_pixel(x, y, skin); // neck
+            }
+        }
+        for y in 50..64 {
+            for x in 6..58 {
+                img.put_pixel(x, y, skin); // shoulders
+            }
+        }
+        img
     }
 
     #[test]
@@ -1010,8 +1129,10 @@ mod tests {
     #[test]
     fn silhouette_fallback_has_geometry_but_no_eyes() {
         // silhouette geometry is read off the cut-out, not the raw photo
+        // (flood-fill cut here — the synthetic portrait is no matte subject)
         let mut img = portrait();
-        cutout(&mut img).expect("plausible cut-out");
+        let refs = sample_refs(&img);
+        assert!(cutout_with_refs(&mut img, &refs), "plausible cut-out");
         let face = silhouette_face(&img, Some(0.55));
         assert!(face.eyes.is_none(), "no eyes without a detected face");
         assert!((face.chin - 0.72).abs() < 1e-5);
@@ -1029,10 +1150,9 @@ mod tests {
     }
 
     #[test]
-    fn cutout_keeps_almost_empty_photo() {
-        // nearly everything matches the background → implausible, image untouched
+    fn cutout_keeps_subjectless_photo_untouched() {
+        // flat gray frame: the model finds nothing salient → image untouched
         let mut img = RgbaImage::from_pixel(64, 64, image::Rgba([240, 240, 240, 255]));
-        img.put_pixel(32, 32, image::Rgba([10, 10, 10, 255]));
         let before = img.clone();
         assert!(cutout(&mut img).is_none());
         assert_eq!(img.as_raw(), before.as_raw());

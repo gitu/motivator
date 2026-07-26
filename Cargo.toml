@@ -22,7 +22,13 @@ arboard = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fastrand = "2"
 rustface = "0.1.7"
+tract-onnx = "0.21"
 
 [profile.release]
 lto = true
 strip = true
+
+# neural matting (tract) is unusably slow unoptimized — keep only our own
+# crate debuggable in dev/test builds
+[profile.dev.package."*"]
+opt-level = 2

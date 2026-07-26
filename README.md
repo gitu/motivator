@@ -40,14 +40,16 @@ actually say — with a little talking animation. Teach it which lines land with
 - **schedule** — time windows that hand the widget to a different friend:
   the work friend 09:00–17:00 on workdays, the coach over lunch, the
   wind-down friend in the evening; overlaps resolve to the shortest window
-- **photo avatars** — upload a photo; the background is removed automatically
-  (flood fill from the borders) and the face is measured by real face
-  detection (embedded SeetaFace model, pure Rust — silhouette heuristic as
-  fallback): mouth line via the lip-parting shadow and teeth band, eye band
-  via a brow-then-eye darkness search, chin and face extent from the box
+- **photo avatars** — upload a photo; the subject — face, hair, upper body —
+  is cut out automatically by an embedded U²-Netp matting model (pure-Rust
+  tract inference; the soft matte keeps single hair strands, works on busy
+  backgrounds) and the face is measured by real face detection (embedded
+  SeetaFace model, pure Rust — silhouette heuristic as fallback): mouth line
+  via the lip-parting shadow and teeth band, eye band via a brow-then-eye
+  darkness search, chin and face extent from the box
 - **photo control** — pick per friend how uploads are processed: *auto
-  cut-out*, *already cut out* (keeps your PNG's transparency, skips the flood
-  fill), or *keep as-is* (stored untouched, no resize, no detection —
+  cut-out*, *already cut out* (keeps your PNG's transparency, skips the
+  matting), or *keep as-is* (stored untouched, no resize, no detection —
   animated files are still decoded into frames); a mouth line slider
   corrects the detected flap hinge when needed
 - **animation styles** — per friend: a talking style (mouth-warp *jaw*,
@@ -253,4 +255,12 @@ native-Wayland — then use your compositor's window rules to pin the widget
 [MIT](LICENSE). The embedded face-detection model
 (`assets/seeta_fd_frontal_v1.0.bin`) is the SeetaFace frontal model by the
 VIPL group (ICT, Chinese Academy of Sciences), BSD-2-Clause, via the
-[rustface](https://github.com/atomashpolskiy/rustface) project.
+[rustface](https://github.com/atomashpolskiy/rustface) project. The embedded
+cut-out model (`assets/u2netp.onnx`) is
+[U²-Netp](https://github.com/xuebinqin/U-2-Net) by Qin et al., Apache-2.0,
+via the [rembg](https://github.com/danielgatis/rembg) project — lightly
+patched for [tract](https://github.com/sonos/tract): dynamic `Resize` sizes
+replaced with the equivalent constant scales, graph pre-simplified with
+onnxsim (numerically identical output). The test fixture
+(`tests/fixtures/stylegan2_face.jpg`) is the same public-domain StyleGAN2
+portrait as the demo avatar.
