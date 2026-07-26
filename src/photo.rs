@@ -505,8 +505,8 @@ fn center_on_teeth(img: &RgbaImage, bbox: (i32, i32, u32, u32), mouth_y: f32) ->
 
 /// Parse the embedded U²-Netp model once; None if tract can't run it
 /// (should not happen — the model ships with the binary).
-fn matte_model() -> Option<&'static TypedSimplePlan<TypedModel>> {
-    static MODEL: OnceLock<Option<TypedSimplePlan<TypedModel>>> = OnceLock::new();
+fn matte_model() -> Option<&'static Arc<TypedSimplePlan>> {
+    static MODEL: OnceLock<Option<Arc<TypedSimplePlan>>> = OnceLock::new();
     MODEL
         .get_or_init(|| {
             let s = MATTE_SIZE as i64;
@@ -547,7 +547,7 @@ fn matte(img: &RgbaImage) -> Option<image::GrayImage> {
         .run(tvec!(input.into()))
         .map_err(|e| eprintln!("matting failed: {e:?}"))
         .ok()?;
-    let out = result.first()?.to_array_view::<f32>().ok()?;
+    let out = result.first()?.to_plain_array_view::<f32>().ok()?;
 
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     for &v in out.iter() {
